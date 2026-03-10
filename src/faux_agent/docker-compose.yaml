@@ -1,0 +1,17 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: linuxad_db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: linuxad
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./init/structure.sql:/docker-entrypoint-initdb.d/01_structure.sql
+      - ./init/linuxad_fake_data.sql:/docker-entrypoint-initdb.d/02_linuxad_fake_data.sql
+      - linuxad_data:/var/lib/mysql
+
+volumes:
+  linuxad_data:
