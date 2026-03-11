@@ -1,5 +1,5 @@
 -- ============================================================
--- LinuxAD - Schéma MySQL complet
+-- LinuxAD - Schéma PostgreSQL
 -- À placer dans init/01_schema.sql
 -- ============================================================
 
@@ -10,8 +10,8 @@ CREATE TABLE IF NOT EXISTS admin_users (
     password_hash VARCHAR(64)  NOT NULL,
     role          VARCHAR(20)  NOT NULL DEFAULT 'admin',
     mfa_enabled   BOOLEAN      NOT NULL DEFAULT FALSE,
-    created_at    DATETIME     NOT NULL DEFAULT NOW(),
-    last_login    DATETIME
+    created_at    TIMESTAMP    NOT NULL DEFAULT NOW(),
+    last_login    TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS machines (
@@ -21,8 +21,8 @@ CREATE TABLE IF NOT EXISTS machines (
     os_version     VARCHAR(100),
     kernel_version VARCHAR(100),
     status         VARCHAR(20)  NOT NULL DEFAULT 'pending',
-    enrolled_at    DATETIME     NOT NULL DEFAULT NOW(),
-    last_contact   DATETIME
+    enrolled_at    TIMESTAMP    NOT NULL DEFAULT NOW(),
+    last_contact   TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -30,14 +30,14 @@ CREATE TABLE IF NOT EXISTS agents (
     machine_id    VARCHAR(36)  NOT NULL,
     secret_hash   VARCHAR(64)  NOT NULL,
     status        VARCHAR(20)  NOT NULL DEFAULT 'offline',
-    enrolled_at   DATETIME     NOT NULL DEFAULT NOW(),
-    last_seen     DATETIME,
+    enrolled_at   TIMESTAMP    NOT NULL DEFAULT NOW(),
+    last_seen     TIMESTAMP,
     ip_address    VARCHAR(45),
     agent_version VARCHAR(20),
     FOREIGN KEY (machine_id) REFERENCES machines(id)
 );
 
-CREATE TABLE IF NOT EXISTS `groups` (
+CREATE TABLE IF NOT EXISTS "groups" (
     id          VARCHAR(36)  PRIMARY KEY,
     name        VARCHAR(100) UNIQUE NOT NULL,
     description TEXT,
@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS users (
     home_directory VARCHAR(255),
     login_shell    VARCHAR(100) DEFAULT '/bin/bash',
     created_by     VARCHAR(36),
-    created_at     DATETIME NOT NULL DEFAULT NOW()
+    created_at     TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS gpo (
@@ -65,8 +65,8 @@ CREATE TABLE IF NOT EXISTS gpo (
     status      VARCHAR(20)  NOT NULL DEFAULT 'draft',
     content     JSON,
     signature   VARCHAR(64),
-    created_at  DATETIME     NOT NULL DEFAULT NOW(),
-    updated_at  DATETIME     NOT NULL DEFAULT NOW()
+    created_at  TIMESTAMP    NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMP    NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS gpo_assignments (
@@ -85,13 +85,13 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     action        VARCHAR(100),
     resource_type VARCHAR(50),
     ip_address    VARCHAR(45),
-    timestamp     DATETIME     NOT NULL DEFAULT NOW()
+    timestamp     TIMESTAMP    NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS agent_logs (
     id        VARCHAR(36)  PRIMARY KEY,
     agent_id  VARCHAR(36),
-    timestamp DATETIME     NOT NULL DEFAULT NOW(),
+    timestamp TIMESTAMP    NOT NULL DEFAULT NOW(),
     level     VARCHAR(20),
     category  VARCHAR(50),
     message   TEXT
@@ -103,8 +103,8 @@ CREATE TABLE IF NOT EXISTS enrollment_tokens (
     description  TEXT,
     max_uses     INT          NOT NULL DEFAULT 1,
     current_uses INT          NOT NULL DEFAULT 0,
-    expires_at   DATETIME,
+    expires_at   TIMESTAMP,
     status       VARCHAR(20)  NOT NULL DEFAULT 'active',
     created_by   VARCHAR(36),
-    created_at   DATETIME     NOT NULL DEFAULT NOW()
+    created_at   TIMESTAMP    NOT NULL DEFAULT NOW()
 );

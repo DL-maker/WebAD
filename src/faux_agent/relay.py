@@ -2,20 +2,21 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
 import hashlib
 import time
-import mysql.connector
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from collections import defaultdict
 
 DB = {
     "host":     "localhost",
-    "database": "linuxad",
-    "user":     "root",
+    "dbname":   "linuxad",
+    "user":     "postgres",
     "password": "root"
 }
 
 test = defaultdict(list)
 
 def get_conn():
-    return mysql.connector.connect(**DB)
+    return psycopg2.connect(**DB)
 
 def sha256(s):
     return hashlib.sha256(s.encode()).hexdigest()
@@ -52,7 +53,7 @@ def handle_login(handler, body):
     test[username].append(now)
 
     conn = get_conn()
-    cur  = conn.cursor(dictionary=True)
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("SELECT * FROM admin_users WHERE username = %s", (username,))
     user = cur.fetchone()
     cur.close()
@@ -101,7 +102,7 @@ def handle_refresh(handler, body):
     token_hash = refresh_token.replace("linuxad_refresh_1_", "")
 
     conn = get_conn()
-    cur  = conn.cursor(dictionary=True)
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("SELECT * FROM admin_users")
     users = cur.fetchall()
     cur.close()
@@ -126,7 +127,7 @@ def handle_logout(handler, body):
 
 def handle_machines(handler):
     conn = get_conn()
-    cur  = conn.cursor(dictionary=True)
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("""
         SELECT m.id, m.hostname, m.fqdn, m.status, m.os_version,
                m.last_contact, a.status AS agent_status, a.ip_address
@@ -142,7 +143,7 @@ def handle_machines(handler):
 
 def handle_users(handler):
     conn = get_conn()
-    cur  = conn.cursor(dictionary=True)
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("SELECT uid, cn, email, uid_number, home_directory, login_shell FROM users ORDER BY uid_number")
     rows = cur.fetchall()
     cur.close()
@@ -152,7 +153,7 @@ def handle_users(handler):
 
 def handle_gpo(handler):
     conn = get_conn()
-    cur  = conn.cursor(dictionary=True)
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("SELECT id, name, description, version, status, updated_at FROM gpo ORDER BY updated_at DESC")
     rows = cur.fetchall()
     cur.close()
@@ -162,8 +163,8 @@ def handle_gpo(handler):
 
 def handle_groups(handler):
     conn = get_conn()
-    cur  = conn.cursor(dictionary=True)
-    cur.execute("SELECT id, name, description, ldap_dn FROM `groups` ORDER BY name")
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute('SELECT id, name, description, ldap_dn FROM "groups" ORDER BY name')
     rows = cur.fetchall()
     cur.close()
     conn.close()
@@ -172,7 +173,7 @@ def handle_groups(handler):
 
 def handle_dashboard_stats(handler):
     conn = get_conn()
-    cur  = conn.cursor(dictionary=True)
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
 
     cur.execute("SELECT status, COUNT(*) as count FROM machines GROUP BY status")
     machine_rows = {r["status"]: r["count"] for r in cur.fetchall()}
@@ -183,7 +184,7 @@ def handle_dashboard_stats(handler):
     cur.execute("SELECT COUNT(*) as count FROM users")
     user_count = cur.fetchone()["count"]
 
-    cur.execute("SELECT COUNT(*) as count FROM `groups`")
+    cur.execute('SELECT COUNT(*) as count FROM "groups"')
     group_count = cur.fetchone()["count"]
 
     cur.execute("SELECT status, COUNT(*) as count FROM gpo GROUP BY status")
@@ -268,7 +269,7 @@ def handle_enrollment_tokens_create(handler, body):
 
 def handle_enrollment_tokens_list(handler):
     conn = get_conn()
-    cur  = conn.cursor(dictionary=True)
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("SELECT id, description, max_uses, current_uses, expires_at, status, created_by, created_at FROM enrollment_tokens ORDER BY created_at DESC")
     rows = cur.fetchall()
     cur.close()
@@ -281,7 +282,7 @@ def handle_enrollment_tokens_list(handler):
 
 def handle_enrollment_token_delete(handler, token_id):
     conn = get_conn()
-    cur  = conn.cursor(dictionary=True)
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("SELECT * FROM enrollment_tokens WHERE id = %s", (token_id,))
     token = cur.fetchone()
 
@@ -326,7 +327,7 @@ def handle_enroll(handler, body):
     token_hash = sha256(enrollment_token)
 
     conn = get_conn()
-    cur  = conn.cursor(dictionary=True)
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("SELECT * FROM enrollment_tokens WHERE token_hash = %s AND status = 'active'", (token_hash,))
     token = cur.fetchone()
 
@@ -383,6 +384,91 @@ def handle_enroll(handler, body):
     })
 
 
+# ── Agent ─────────────────────────────────────────────────────
+
+def handle_agent_poll(handler, body):
+    agent_id = body.get("agent_id", "")
+    status   = body.get("status", {})
+
+    if not agent_id:
+        return json_response(handler, 400, {"error": {"code": "VALIDATION_ERROR", "message": "agent_id requis"}})
+    conn = get_conn()
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT * FROM agents WHERE id = %s", (agent_id,))
+    agent = cur.fetchone()
+
+    if not agent:
+        cur.close()
+        conn.close()
+        return json_response(handler, 401, {"error": {"code": "INVALID_SIGNATURE", "message": "Agent inconnu"}})
+
+    # Update last_seen et status
+    cur2 = conn.cursor()
+    cur2.execute("UPDATE agents SET last_seen = NOW(), status = 'online' WHERE id = %s", (agent_id,))
+    cur2.execute("UPDATE machines SET last_contact = NOW() WHERE id = %s", (agent["machine_id"],))
+    conn.commit()
+    cur.close()
+    cur2.close()
+    conn.close()
+    json_response(handler, 200, {
+        "commands":          [],
+        "gpo_updates":       [],
+        "gpo_removals":      [],
+        "next_poll_interval": 60,
+        "server_time":       time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "rotate_secret":     False,
+        "new_secret":        None
+    })
+
+
+def handle_agent_logs(handler, body):
+    agent_id = body.get("agent_id", "")
+    logs     = body.get("logs", [])
+
+    if not agent_id:
+        return json_response(handler, 400, {"error": {"code": "VALIDATION_ERROR", "message": "agent_id requis"}})
+
+    if len(logs) > 100:
+        return json_response(handler, 400, {"error": {"code": "VALIDATION_ERROR", "message": "Max 100 logs par requete"}})
+
+    import uuid as _uuid
+    conn = get_conn()
+    cur  = conn.cursor()
+    accepted = 0
+    rejected = 0
+    errors   = []
+    for log in logs:
+        try:
+            cur.execute("""
+                INSERT INTO agent_logs (id, agent_id, timestamp, level, category, message)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (str(_uuid.uuid4()), agent_id,
+                  log.get("timestamp"), log.get("level"),
+                  log.get("category"), log.get("message")))
+            accepted += 1
+        except Exception as e:
+            rejected += 1
+            errors.append(str(e))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+    json_response(handler, 202, {"accepted": accepted, "rejected": rejected, "errors": errors})
+
+
+def handle_agent_gpo_report(handler, body):
+    import uuid as _uuid
+    agent_id    = body.get("agent_id", "")
+    gpo_id      = body.get("gpo_id", "")
+    status      = body.get("status", "")
+    if not all([agent_id, gpo_id, status]):
+        return json_response(handler, 400, {"error": {"code": "VALIDATION_ERROR", "message": "Champs requis manquants"}})
+    json_response(handler, 200, {
+        "acknowledged":   True,
+        "application_id": str(_uuid.uuid4())
+    })
+
+
 # ── Handler HTTP ──────────────────────────────────────────────
 
 class RelayHandler(BaseHTTPRequestHandler):
@@ -411,6 +497,12 @@ class RelayHandler(BaseHTTPRequestHandler):
             handle_enrollment_tokens_create(self, body)
         elif self.path == "/api/v1/enrollment/enroll":
             handle_enroll(self, body)
+        elif self.path == "/api/v1/agent/poll":
+            handle_agent_poll(self, body)
+        elif self.path == "/api/v1/agent/logs":
+            handle_agent_logs(self, body)
+        elif self.path == "/api/v1/agent/gpo/report":
+            handle_agent_gpo_report(self, body)
         else:
             json_response(self, 404, {"error": {"code": "NOT_FOUND", "message": f"Route {self.path} introuvable"}})
 
@@ -453,4 +545,7 @@ if __name__ == "__main__":
     print(f"GET  /api/v1/enrollment/tokens")
     print(f"DELETE /api/v1/enrollment/tokens/{{id}}")
     print(f"POST /api/v1/enrollment/enroll")
+    print(f"POST /api/v1/agent/poll")
+    print(f"POST /api/v1/agent/logs")
+    print(f"POST /api/v1/agent/gpo/report")
     server.serve_forever()

@@ -1,17 +1,17 @@
 services:
-  mysql:
-    image: mysql:8.0
+  postgres:
+    image: postgres:16
     container_name: linuxad_db
     restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: root
-      MYSQL_DATABASE: linuxad
+      POSTGRES_PASSWORD: root
+      POSTGRES_DB: linuxad
     ports:
-      - "3306:3306"
+      - "5432:5432"
     volumes:
       - ./init/structure.sql:/docker-entrypoint-initdb.d/01_structure.sql
       - ./init/linuxad_fake_data.sql:/docker-entrypoint-initdb.d/02_linuxad_fake_data.sql
-      - linuxad_data:/var/lib/mysql
+      - linuxad_data:/var/lib/postgresql/data
 
 volumes:
   linuxad_data:

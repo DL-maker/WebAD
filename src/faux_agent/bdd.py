@@ -1,4 +1,4 @@
-import hashlib
+﻿import hashlib
 import uuid
 import random
 from datetime import datetime, timedelta
@@ -60,67 +60,67 @@ lines = []
 # admin_users
 lines.append("\n-- Admin ---------------------------------------------------")
 for u in admin_users:
-    lines.append(f"""INSERT IGNORE INTO admin_users (id, username, email, password_hash, role, mfa_enabled, created_at) VALUES
-  ('{u['id']}', '{u['username']}', '{u['email']}', '{sha256(u['password'])}', '{u['role']}', {'TRUE' if u['mfa'] else 'FALSE'}, '{rand_date(90)}');""")
+    lines.append(f"""INSERT INTO admin_users (id, username, email, password_hash, role, mfa_enabled, created_at) VALUES
+  ('{u['id']}', '{u['username']}', '{u['email']}', '{sha256(u['password'])}', '{u['role']}', {'TRUE' if u['mfa'] else 'FALSE'}, '{rand_date(90)}') ON CONFLICT DO NOTHING;""")
 
 lines.append("\n-- Machines ---------------------------------------------------")
 for m in machines:
     last_contact = rand_date(2)
-    lines.append(f"""INSERT IGNORE INTO machines (id, hostname, fqdn, os_version, kernel_version, status, enrolled_at, last_contact) VALUES
-  ('{m['id']}', '{m['hostname']}', '{m['fqdn']}', '{m['os']}', '{m['kernel']}', '{m['status']}', '{rand_date(60)}', '{last_contact}');""")
+    lines.append(f"""INSERT INTO machines (id, hostname, fqdn, os_version, kernel_version, status, enrolled_at, last_contact) VALUES
+  ('{m['id']}', '{m['hostname']}', '{m['fqdn']}', '{m['os']}', '{m['kernel']}', '{m['status']}', '{rand_date(60)}', '{last_contact}') ON CONFLICT DO NOTHING;""")
 
-lines.append("\n-- Agents ---------------------------------------------------──")
+lines.append("\n-- Agents ---------------------------------------------------")
 for m in machines:
     agent_id = uid()
     status = "online" if m["status"] == "active" else "offline"
-    lines.append(f"""INSERT IGNORE INTO agents (id, machine_id, secret_hash, status, enrolled_at, last_seen, ip_address, agent_version) VALUES
-  ('{agent_id}', '{m['id']}', '{sha256('agent_secret_' + m['hostname'])}', '{status}', '{rand_date(60)}', '{rand_date(1)}', '192.168.1.{random.randint(10,200)}', '1.0.0');""")
+    lines.append(f"""INSERT INTO agents (id, machine_id, secret_hash, status, enrolled_at, last_seen, ip_address, agent_version) VALUES
+  ('{agent_id}', '{m['id']}', '{sha256('agent_secret_' + m['hostname'])}', '{status}', '{rand_date(60)}', '{rand_date(1)}', '192.168.1.{random.randint(10,200)}', '1.0.0') ON CONFLICT DO NOTHING;""")
 
 lines.append("\n-- Groups ---------------------------------------------------")
 for g in groups:
-    lines.append(f"""INSERT IGNORE INTO `groups` (id, name, description, ldap_dn) VALUES
-  ('{g['id']}', '{g['name']}', '{g['desc']}', 'cn={g['name']},ou=Groups,dc=linuxad,dc=local');""")
+    lines.append(f"""INSERT INTO "groups" (id, name, description, ldap_dn) VALUES
+  ('{g['id']}', '{g['name']}', '{g['desc']}', 'cn={g['name']},ou=Groups,dc=linuxad,dc=local') ON CONFLICT DO NOTHING;""")
 
 lines.append("\n-- Users LDAP ---------------------------------------------------")
 admin_id = admin_users[0]['id']
 for u in ldap_users:
-    lines.append(f"""INSERT IGNORE INTO users (uid, ldap_dn, cn, email, uid_number, gid_number, home_directory, created_by) VALUES
-  ('{u['uid']}', 'uid={u['uid']},ou=People,dc=linuxad,dc=local', '{u['cn']}', '{u['email']}', {u['uid_number']}, {u['gid']}, '/home/{u['uid']}', '{admin_id}');""")
+    lines.append(f"""INSERT INTO users (uid, ldap_dn, cn, email, uid_number, gid_number, home_directory, created_by) VALUES
+  ('{u['uid']}', 'uid={u['uid']},ou=People,dc=linuxad,dc=local', '{u['cn']}', '{u['email']}', {u['uid_number']}, {u['gid']}, '/home/{u['uid']}', '{admin_id}') ON CONFLICT DO NOTHING;""")
 
 lines.append("\n-- GPO --------------------------------------------------")
 gpo_content = '{"schema_version": "1.0", "policies": []}'
 for g in gpos:
     sig = sha256(g['name'] + str(g['version']))
-    lines.append(f"""INSERT IGNORE INTO gpo (id, name, description, version, status, content, signature, created_at, updated_at) VALUES
-  ('{g['id']}', '{g['name']}', '{g['desc']}', {g['version']}, '{g['status']}', '{gpo_content}', '{sig}', '{rand_date(30)}', '{rand_date(5)}');""")
+    lines.append(f"""INSERT INTO gpo (id, name, description, version, status, content, signature, created_at, updated_at) VALUES
+  ('{g['id']}', '{g['name']}', '{g['desc']}', {g['version']}, '{g['status']}', '{gpo_content}', '{sig}', '{rand_date(30)}', '{rand_date(5)}') ON CONFLICT DO NOTHING;""")
 
 lines.append("\n-- GPO Assignments ---------------------------------------------------")
 active_gpos = [g for g in gpos if g['status'] == 'active']
 for g in active_gpos:
     assign_id = uid()
-    lines.append(f"""INSERT IGNORE INTO gpo_assignments (id, gpo_id, target_type, priority, enabled) VALUES
-  ('{assign_id}', '{g['id']}', 'all', 100, TRUE);""")
+    lines.append(f"""INSERT INTO gpo_assignments (id, gpo_id, target_type, priority, enabled) VALUES
+  ('{assign_id}', '{g['id']}', 'all', 100, TRUE) ON CONFLICT DO NOTHING;""")
 
 lines.append("\n-- Audit Logs ---------------------------------------------------")
 actions_list = ["login", "create", "update", "delete", "enroll"]
 resources    = ["machine", "user", "gpo", "group"]
 for i in range(10):
-    lines.append(f"""INSERT IGNORE INTO audit_logs (id, actor_type, actor_id, action, resource_type, ip_address, timestamp) VALUES
-  ('{uid()}', 'admin', '{admin_users[0]['id']}', '{random.choice(actions_list)}', '{random.choice(resources)}', '10.0.0.{random.randint(1,10)}', '{rand_date(7)}');""")
+    lines.append(f"""INSERT INTO audit_logs (id, actor_type, actor_id, action, resource_type, ip_address, timestamp) VALUES
+  ('{uid()}', 'admin', '{admin_users[0]['id']}', '{random.choice(actions_list)}', '{random.choice(resources)}', '10.0.0.{random.randint(1,10)}', '{rand_date(7)}') ON CONFLICT DO NOTHING;""")
 
 lines.append("\n-- Agent Logs ---------------------------------------------------")
 levels      = ["info", "warning", "error"]
 categories  = ["gpo", "system", "security", "network"]
 for m in machines[:3]:
     for i in range(3):
-        lines.append(f"""INSERT IGNORE INTO agent_logs (id, agent_id, timestamp, level, category, message) VALUES
-  ('{uid()}', (SELECT id FROM agents WHERE machine_id = '{m['id']}' LIMIT 1), '{rand_date(3)}', '{random.choice(levels)}', '{random.choice(categories)}', 'Test log entry {i+1} for {m['hostname']}');""")
+        lines.append(f"""INSERT INTO agent_logs (id, agent_id, timestamp, level, category, message) VALUES
+  ('{uid()}', (SELECT id FROM agents WHERE machine_id = '{m['id']}' LIMIT 1), '{rand_date(3)}', '{random.choice(levels)}', '{random.choice(categories)}', 'Test log entry {i+1} for {m['hostname']}') ON CONFLICT DO NOTHING;""")
 
 lines.append("\n-- Enrollment Tokens ---------------------------------------------------")
 for i in range(3):
     exp = (datetime.now() + timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S')
-    lines.append(f"""INSERT IGNORE INTO enrollment_tokens (id, token_hash, description, max_uses, current_uses, expires_at, status, created_by) VALUES
-  ('{uid()}', '{sha256('token_' + str(i))}', 'Token de test {i+1}', 10, {random.randint(0,3)}, '{exp}', 'active', '{admin_id}');""")
+    lines.append(f"""INSERT INTO enrollment_tokens (id, token_hash, description, max_uses, current_uses, expires_at, status, created_by) VALUES
+  ('{uid()}', '{sha256('token_' + str(i))}', 'Token de test {i+1}', 10, {random.randint(0,3)}, '{exp}', 'active', '{admin_id}') ON CONFLICT DO NOTHING;""")
 
 #  Écriture ---------------------------------------------------
 output = "\n".join(lines)

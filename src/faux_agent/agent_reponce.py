@@ -1,4 +1,4 @@
-import mysql.connector
+﻿import psycopg2
 import hashlib
 import uuid
 import json
@@ -10,8 +10,8 @@ from collections import defaultdict
 # ── Config DB ────────────────────────────────────────────────
 DB = {
     "host":     "localhost",
-    "database": "linuxad",
-    "user":     "root",
+    "dbname":   "linuxad",
+    "user":     "postgres",
     "password": "root"
 }
 
@@ -19,7 +19,7 @@ DB = {
 _attempts: dict = defaultdict(list)
 
 def get_conn():
-    return mysql.connector.connect(**DB)
+    return psycopg2.connect(**DB)
 
 def sha256(s: str) -> str:
     return hashlib.sha256(s.encode()).hexdigest()
@@ -49,7 +49,7 @@ def login(username: str, password: str, mfa_code: str = None):
     _attempts[username].append(now)
 
     conn = get_conn()
-    cur  = conn.cursor(dictionary=True)
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("SELECT * FROM admin_users WHERE username = %s", (username,))
     user = cur.fetchone()
     cur.close()
@@ -100,7 +100,7 @@ def login(username: str, password: str, mfa_code: str = None):
 def list_machines():
     print("\n── Requête GET /api/v1/admin/machines ─────────────────")
     conn = get_conn()
-    cur  = conn.cursor(dictionary=True)
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("""
         SELECT m.id, m.hostname, m.fqdn, m.status, m.os_version,
                m.last_contact, a.status AS agent_status, a.ip_address
@@ -123,7 +123,7 @@ def list_machines():
 def list_users():
     print("\n── Requête GET /api/v1/admin/users ────────────────────")
     conn = get_conn()
-    cur  = conn.cursor(dictionary=True)
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("SELECT uid, cn, email, uid_number, home_directory, login_shell FROM users ORDER BY uid_number")
     rows = cur.fetchall()
     cur.close()
@@ -135,7 +135,7 @@ def list_users():
 def list_gpo():
     print("\n── Requête GET /api/v1/admin/gpo ──────────────────────")
     conn = get_conn()
-    cur  = conn.cursor(dictionary=True)
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("SELECT id, name, description, version, status, updated_at FROM gpo ORDER BY updated_at DESC")
     rows = cur.fetchall()
     cur.close()
