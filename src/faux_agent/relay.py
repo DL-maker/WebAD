@@ -222,6 +222,167 @@ def handle_dashboard_stats(handler):
     })
 
 
+# ── Enrollment ───────────────────────────────────────────────
+
+def handle_enrollment_tokens_create(handler, body):
+    import uuid as _uuid
+    from datetime import datetime, timedelta
+
+    description     = body.get("description", "")
+    max_uses        = body.get("max_uses", 10)
+    expires_in_hours= body.get("expires_in_hours", 24)
+    allowed_groups  = body.get("allowed_groups", [])
+
+    if not isinstance(max_uses, int) or not (1 <= max_uses <= 1000):
+        return json_response(handler, 400, {"error": {"code": "VALIDATION_ERROR", "message": "max_uses doit etre entre 1 et 1000"}})
+    if not isinstance(expires_in_hours, int) or not (1 <= expires_in_hours <= 720):
+        return json_response(handler, 400, {"error": {"code": "VALIDATION_ERROR", "message": "expires_in_hours doit etre entre 1 et 720"}})
+
+    token_id    = str(_uuid.uuid4())
+    token_plain = f"linuxad_enroll_1_{sha256(token_id)[:24]}"
+    token_hash  = sha256(token_plain)
+    expires_at  = datetime.now() + timedelta(hours=expires_in_hours)
+
+    conn = get_conn()
+    cur  = conn.cursor()
+    cur.execute("""
+        INSERT INTO enrollment_tokens (id, token_hash, description, max_uses, current_uses, expires_at, status, created_by)
+        VALUES (%s, %s, %s, %s, 0, %s, 'active', 'admin')
+    """, (token_id, token_hash, description, max_uses, expires_at))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    json_response(handler, 201, {
+        "id":           token_id,
+        "token":        token_plain,
+        "description":  description,
+        "max_uses":     max_uses,
+        "current_uses": 0,
+        "allowed_groups": allowed_groups,
+        "expires_at":   expires_at.isoformat() + "Z",
+        "created_at":   time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "created_by":   "admin"
+    })
+
+
+def handle_enrollment_tokens_list(handler):
+    conn = get_conn()
+    cur  = conn.cursor(dictionary=True)
+    cur.execute("SELECT id, description, max_uses, current_uses, expires_at, status, created_by, created_at FROM enrollment_tokens ORDER BY created_at DESC")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    json_response(handler, 200, {
+        "data": rows,
+        "pagination": {"page": 1, "per_page": 20, "total": len(rows), "total_pages": 1, "has_next": False, "has_prev": False}
+    })
+
+
+def handle_enrollment_token_delete(handler, token_id):
+    conn = get_conn()
+    cur  = conn.cursor(dictionary=True)
+    cur.execute("SELECT * FROM enrollment_tokens WHERE id = %s", (token_id,))
+    token = cur.fetchone()
+
+    if not token:
+        cur.close()
+        conn.close()
+        return json_response(handler, 404, {"error": {"code": "NOT_FOUND", "message": "Token non trouve"}})
+
+    if token["status"] == "revoked":
+        cur.close()
+        conn.close()
+        return json_response(handler, 409, {"error": {"code": "CONFLICT", "message": "Token deja revoque"}})
+
+    cur2 = conn.cursor()
+    cur2.execute("UPDATE enrollment_tokens SET status = 'revoked' WHERE id = %s", (token_id,))
+    conn.commit()
+    cur.close()
+    cur2.close()
+    conn.close()
+
+    json_response(handler, 200, {
+        "id":         token_id,
+        "status":     "revoked",
+        "revoked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "revoked_by": "admin"
+    })
+
+
+def handle_enroll(handler, body):
+    import uuid as _uuid
+    from datetime import datetime
+
+    enrollment_token = body.get("enrollment_token", "")
+    hostname         = body.get("hostname", "")
+    fqdn             = body.get("fqdn", "")
+    os_info          = body.get("os_info", {})
+    agent_version    = body.get("agent_version", "1.0.0")
+
+    if not all([enrollment_token, hostname, fqdn, os_info]):
+        return json_response(handler, 400, {"error": {"code": "VALIDATION_ERROR", "message": "Champs requis manquants"}})
+
+    token_hash = sha256(enrollment_token)
+
+    conn = get_conn()
+    cur  = conn.cursor(dictionary=True)
+    cur.execute("SELECT * FROM enrollment_tokens WHERE token_hash = %s AND status = 'active'", (token_hash,))
+    token = cur.fetchone()
+
+    if not token:
+        cur.close()
+        conn.close()
+        return json_response(handler, 401, {"error": {"code": "INVALID_TOKEN", "message": "Token invalide, expire ou revoque"}})
+
+    if token["current_uses"] >= token["max_uses"]:
+        cur.close()
+        conn.close()
+        return json_response(handler, 429, {"error": {"code": "RATE_LIMITED", "message": "Token epuise (max_uses atteint)"}})
+
+    cur.execute("SELECT id FROM machines WHERE fqdn = %s", (fqdn,))
+    if cur.fetchone():
+        cur.close()
+        conn.close()
+        return json_response(handler, 409, {"error": {"code": "CONFLICT", "message": "Machine deja enrolee (meme FQDN)"}})
+
+    machine_id  = str(_uuid.uuid4())
+    agent_id    = str(_uuid.uuid4())
+    agent_secret = f"linuxad_secret_1_{sha256(agent_id)[:24]}"
+
+    cur2 = conn.cursor()
+    cur2.execute("""
+        INSERT INTO machines (id, hostname, fqdn, os_version, kernel_version, status, enrolled_at, last_contact)
+        VALUES (%s, %s, %s, %s, %s, 'active', NOW(), NOW())
+    """, (machine_id, hostname, fqdn,
+          f"{os_info.get('distribution','')} {os_info.get('version','')}",
+          os_info.get("kernel", "")))
+
+    cur2.execute("""
+        INSERT INTO agents (id, machine_id, secret_hash, status, enrolled_at, last_seen, ip_address, agent_version)
+        VALUES (%s, %s, %s, 'online', NOW(), NOW(), %s, %s)
+    """, (agent_id, machine_id, sha256(agent_secret),
+          body.get("network_info", {}).get("primary_ip", ""),
+          agent_version))
+
+    cur2.execute("UPDATE enrollment_tokens SET current_uses = current_uses + 1 WHERE id = %s", (token["id"],))
+    conn.commit()
+    cur.close()
+    cur2.close()
+    conn.close()
+
+    json_response(handler, 201, {
+        "machine_id":       machine_id,
+        "agent_id":         agent_id,
+        "agent_secret":     agent_secret,
+        "server_public_key": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA_MOCK_KEY\n-----END PUBLIC KEY-----",
+        "api_endpoint":     "http://127.0.0.1:4444/api/v1",
+        "polling_interval": 60,
+        "enrolled_at":      time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "assigned_groups":  []
+    })
+
+
 # ── Handler HTTP ──────────────────────────────────────────────
 
 class RelayHandler(BaseHTTPRequestHandler):
@@ -246,6 +407,17 @@ class RelayHandler(BaseHTTPRequestHandler):
             handle_refresh(self, body)
         elif self.path == "/api/v1/admin/auth/logout":
             handle_logout(self, body)
+        elif self.path == "/api/v1/enrollment/tokens":
+            handle_enrollment_tokens_create(self, body)
+        elif self.path == "/api/v1/enrollment/enroll":
+            handle_enroll(self, body)
+        else:
+            json_response(self, 404, {"error": {"code": "NOT_FOUND", "message": f"Route {self.path} introuvable"}})
+
+    def do_DELETE(self):
+        if self.path.startswith("/api/v1/enrollment/tokens/"):
+            token_id = self.path.split("/")[-1]
+            handle_enrollment_token_delete(self, token_id)
         else:
             json_response(self, 404, {"error": {"code": "NOT_FOUND", "message": f"Route {self.path} introuvable"}})
 
@@ -260,6 +432,8 @@ class RelayHandler(BaseHTTPRequestHandler):
             handle_groups(self)
         elif self.path.startswith("/api/v1/admin/dashboard/stats"):
             handle_dashboard_stats(self)
+        elif self.path.startswith("/api/v1/enrollment/tokens"):
+            handle_enrollment_tokens_list(self)
         else:
             json_response(self, 404, {"error": {"code": "NOT_FOUND", "message": f"Route {self.path} introuvable"}})
 
@@ -275,4 +449,8 @@ if __name__ == "__main__":
     print(f"GET  /api/v1/admin/users")
     print(f"GET  /api/v1/admin/gpo")
     print(f"GET  /api/v1/admin/groups")
+    print(f"POST /api/v1/enrollment/tokens")
+    print(f"GET  /api/v1/enrollment/tokens")
+    print(f"DELETE /api/v1/enrollment/tokens/{{id}}")
+    print(f"POST /api/v1/enrollment/enroll")
     server.serve_forever()
