@@ -1,6 +1,5 @@
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
-import uuid as _uuid
 import hashlib
 import time
 import psycopg2
@@ -233,11 +232,163 @@ def handle_machine_delete(handler, machine_id):
 def handle_users(handler):
     conn = get_conn()
     cur  = get_cursor(conn)
-    cur.execute("SELECT uid, cn, email, uid_number, home_directory, login_shell FROM users ORDER BY uid_number")
+    cur.execute("SELECT uid, cn, email, uid_number, gid_number, home_directory, login_shell, created_at FROM users ORDER BY uid_number")
     rows = cur.fetchall()
     cur.close()
     conn.close()
     json_response(handler, 200, {"data": rows, "pagination": {"total": len(rows), "page": 1, "per_page": 20}})
+
+
+def handle_user_detail(handler, uid):
+    conn = get_conn()
+    cur  = get_cursor(conn)
+    cur.execute("SELECT * FROM users WHERE uid = %s", (uid,))
+    user = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    if not user:
+        return json_response(handler, 404, {"error": {"code": "NOT_FOUND", "message": "Utilisateur non trouve"}})
+
+    json_response(handler, 200, {
+        **dict(user),
+        "machines_authorized": [],
+        "last_login_machines": []
+    })
+
+
+def handle_user_create(handler, body):
+    import uuid as _uuid
+
+    uid        = body.get("uid", "")
+    cn         = body.get("cn", "")
+    sn         = body.get("sn", "")
+    email      = body.get("email", "")
+    password   = body.get("password", "")
+    login_shell = body.get("login_shell", "/bin/bash")
+    home_dir   = body.get("home_directory", f"/home/{uid}")
+
+    if not all([uid, cn, email, password]):
+        return json_response(handler, 400, {"error": {"code": "VALIDATION_ERROR", "message": "Champs requis manquants"}})
+    if len(password) < 12:
+        return json_response(handler, 400, {"error": {"code": "VALIDATION_ERROR", "message": "Mot de passe trop court (min 12 chars)"}})
+
+    conn = get_conn()
+    cur  = get_cursor(conn)
+    cur.execute("SELECT uid FROM users WHERE uid = %s OR email = %s", (uid, email))
+    if cur.fetchone():
+        cur.close()
+        conn.close()
+        return json_response(handler, 409, {"error": {"code": "CONFLICT", "message": "uid ou email deja existant"}})
+
+    cur.execute("SELECT COALESCE(MAX(uid_number), 10000) + 1 AS next FROM users")
+    uid_number = cur.fetchone()["next"]
+
+    cur2 = conn.cursor()
+    cur2.execute("""
+        INSERT INTO users (uid, ldap_dn, cn, email, uid_number, gid_number, home_directory, login_shell, created_by)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'admin')
+    """, (uid, f"uid={uid},ou=People,dc=linuxad,dc=local", cn, email, uid_number, uid_number, home_dir, login_shell))
+    conn.commit()
+    cur.close()
+    cur2.close()
+    conn.close()
+
+    json_response(handler, 201, {
+        "uid":            uid,
+        "cn":             cn,
+        "sn":             sn,
+        "email":          email,
+        "uid_number":     uid_number,
+        "gid_number":     uid_number,
+        "home_directory": home_dir,
+        "login_shell":    login_shell,
+        "groups":         body.get("groups", []),
+        "ldap_dn":        f"uid={uid},ou=People,dc=linuxad,dc=local",
+        "created_at":     time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    })
+
+
+def handle_user_patch(handler, uid, body):
+    conn = get_conn()
+    cur  = get_cursor(conn)
+    cur.execute("SELECT * FROM users WHERE uid = %s", (uid,))
+    user = cur.fetchone()
+
+    if not user:
+        cur.close()
+        conn.close()
+        return json_response(handler, 404, {"error": {"code": "NOT_FOUND", "message": "Utilisateur non trouve"}})
+
+    fields = []
+    values = []
+    for field in ["cn", "email", "login_shell"]:
+        if field in body:
+            fields.append(f"{field} = %s")
+            values.append(body[field])
+
+    if fields:
+        values.append(uid)
+        cur2 = conn.cursor()
+        cur2.execute(f"UPDATE users SET {', '.join(fields)} WHERE uid = %s", values)
+        conn.commit()
+        cur2.close()
+
+    cur.execute("SELECT * FROM users WHERE uid = %s", (uid,))
+    updated = cur.fetchone()
+    cur.close()
+    conn.close()
+    json_response(handler, 200, dict(updated))
+
+
+def handle_user_delete(handler, uid):
+    conn = get_conn()
+    cur  = get_cursor(conn)
+    cur.execute("SELECT uid FROM users WHERE uid = %s", (uid,))
+    if not cur.fetchone():
+        cur.close()
+        conn.close()
+        return json_response(handler, 404, {"error": {"code": "NOT_FOUND", "message": "Utilisateur non trouve"}})
+
+    cur2 = conn.cursor()
+    cur2.execute("DELETE FROM users WHERE uid = %s", (uid,))
+    conn.commit()
+    cur.close()
+    cur2.close()
+    conn.close()
+
+    json_response(handler, 200, {
+        "uid":        uid,
+        "deleted":    True,
+        "deleted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "deleted_by": "admin"
+    })
+
+
+def handle_user_password(handler, uid, body):
+    new_password = body.get("new_password", "")
+    force_change = body.get("force_change_on_login", False)
+
+    if len(new_password) < 12:
+        return json_response(handler, 400, {"error": {"code": "VALIDATION_ERROR", "message": "Mot de passe trop court (min 12 chars)"}})
+
+    conn = get_conn()
+    cur  = get_cursor(conn)
+    cur.execute("SELECT uid FROM users WHERE uid = %s", (uid,))
+    if not cur.fetchone():
+        cur.close()
+        conn.close()
+        return json_response(handler, 404, {"error": {"code": "NOT_FOUND", "message": "Utilisateur non trouve"}})
+
+    cur.close()
+    conn.close()
+
+    json_response(handler, 200, {
+        "uid":                  uid,
+        "password_changed":     True,
+        "changed_at":           time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "force_change_on_login": force_change
+    })
 
 
 def handle_gpo(handler):
@@ -556,7 +707,7 @@ def handle_agent_logs(handler, body):
 
 
 def handle_agent_gpo_report(handler, body):
-    
+    import uuid as _uuid
 
     agent_id    = body.get("agent_id", "")
     gpo_id      = body.get("gpo_id", "")
@@ -605,6 +756,11 @@ class RelayHandler(BaseHTTPRequestHandler):
             handle_agent_logs(self, body)
         elif self.path == "/api/v1/agent/gpo/report":
             handle_agent_gpo_report(self, body)
+        elif self.path.startswith("/api/v1/admin/users/") and self.path.endswith("/password"):
+            uid = self.path.split("/")[5]
+            handle_user_password(self, uid, body)
+        elif self.path == "/api/v1/admin/users":
+            handle_user_create(self, body)
         else:
             json_response(self, 404, {"error": {"code": "NOT_FOUND", "message": f"Route {self.path} introuvable"}})
 
@@ -615,6 +771,19 @@ class RelayHandler(BaseHTTPRequestHandler):
         elif self.path.startswith("/api/v1/admin/machines/"):
             machine_id = self.path.split("/")[-1]
             handle_machine_delete(self, machine_id)
+        elif self.path.startswith("/api/v1/admin/users/"):
+            uid = self.path.split("/")[5]
+            handle_user_delete(self, uid)
+        else:
+            json_response(self, 404, {"error": {"code": "NOT_FOUND", "message": f"Route {self.path} introuvable"}})
+
+    def do_PATCH(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body   = json.loads(self.rfile.read(length)) if length else {}
+
+        if self.path.startswith("/api/v1/admin/users/"):
+            uid = self.path.split("/")[5]
+            handle_user_patch(self, uid, body)
         else:
             json_response(self, 404, {"error": {"code": "NOT_FOUND", "message": f"Route {self.path} introuvable"}})
 
@@ -624,9 +793,11 @@ class RelayHandler(BaseHTTPRequestHandler):
         elif self.path.startswith("/api/v1/admin/machines/"):
             machine_id = self.path.split("/")[5]
             handle_machine_detail(self, machine_id)
-            handle_machines(self)
-        elif self.path.startswith("/api/v1/admin/users"):
+        elif self.path == "/api/v1/admin/users" or self.path.startswith("/api/v1/admin/users?"):
             handle_users(self)
+        elif self.path.startswith("/api/v1/admin/users/"):
+            uid = self.path.split("/")[5]
+            handle_user_detail(self, uid)
         elif self.path.startswith("/api/v1/admin/gpo"):
             handle_gpo(self)
         elif self.path.startswith("/api/v1/admin/groups"):
