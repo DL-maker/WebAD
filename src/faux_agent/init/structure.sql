@@ -1,5 +1,5 @@
 -- ============================================================
--- LinuxAD - Schéma PostgreSQL
+-- LinuxAD - Schéma MySQL complet
 -- À placer dans init/01_schema.sql
 -- ============================================================
 
@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS admin_users (
     password_hash VARCHAR(64)  NOT NULL,
     role          VARCHAR(20)  NOT NULL DEFAULT 'admin',
     mfa_enabled   BOOLEAN      NOT NULL DEFAULT FALSE,
-    created_at    TIMESTAMP    NOT NULL DEFAULT NOW(),
+    created_at    TIMESTAMP     NOT NULL DEFAULT NOW(),
     last_login    TIMESTAMP
 );
 
@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS machines (
     os_version     VARCHAR(100),
     kernel_version VARCHAR(100),
     status         VARCHAR(20)  NOT NULL DEFAULT 'pending',
-    enrolled_at    TIMESTAMP    NOT NULL DEFAULT NOW(),
+    enrolled_at    TIMESTAMP     NOT NULL DEFAULT NOW(),
     last_contact   TIMESTAMP
 );
 
@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS agents (
     machine_id    VARCHAR(36)  NOT NULL,
     secret_hash   VARCHAR(64)  NOT NULL,
     status        VARCHAR(20)  NOT NULL DEFAULT 'offline',
-    enrolled_at   TIMESTAMP    NOT NULL DEFAULT NOW(),
+    enrolled_at   TIMESTAMP     NOT NULL DEFAULT NOW(),
     last_seen     TIMESTAMP,
     ip_address    VARCHAR(45),
     agent_version VARCHAR(20),
@@ -65,8 +65,8 @@ CREATE TABLE IF NOT EXISTS gpo (
     status      VARCHAR(20)  NOT NULL DEFAULT 'draft',
     content     JSON,
     signature   VARCHAR(64),
-    created_at  TIMESTAMP    NOT NULL DEFAULT NOW(),
-    updated_at  TIMESTAMP    NOT NULL DEFAULT NOW()
+    created_at  TIMESTAMP     NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMP     NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS gpo_assignments (
@@ -85,16 +85,24 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     action        VARCHAR(100),
     resource_type VARCHAR(50),
     ip_address    VARCHAR(45),
-    timestamp     TIMESTAMP    NOT NULL DEFAULT NOW()
+    timestamp     TIMESTAMP     NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS agent_logs (
     id        VARCHAR(36)  PRIMARY KEY,
     agent_id  VARCHAR(36),
-    timestamp TIMESTAMP    NOT NULL DEFAULT NOW(),
+    timestamp TIMESTAMP     NOT NULL DEFAULT NOW(),
     level     VARCHAR(20),
     category  VARCHAR(50),
     message   TEXT
+);
+
+CREATE TABLE IF NOT EXISTS machine_groups (
+    machine_id VARCHAR(36) NOT NULL,
+    group_id   VARCHAR(36) NOT NULL,
+    PRIMARY KEY (machine_id, group_id),
+    FOREIGN KEY (machine_id) REFERENCES machines(id),
+    FOREIGN KEY (group_id)   REFERENCES "groups"(id)
 );
 
 CREATE TABLE IF NOT EXISTS enrollment_tokens (
@@ -106,5 +114,5 @@ CREATE TABLE IF NOT EXISTS enrollment_tokens (
     expires_at   TIMESTAMP,
     status       VARCHAR(20)  NOT NULL DEFAULT 'active',
     created_by   VARCHAR(36),
-    created_at   TIMESTAMP    NOT NULL DEFAULT NOW()
+    created_at   TIMESTAMP     NOT NULL DEFAULT NOW()
 );

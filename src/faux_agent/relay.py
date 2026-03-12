@@ -1,9 +1,10 @@
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
+import uuid as _uuid
 import hashlib
 import time
 import psycopg2
-from psycopg2.extras import RealDictCursor
+import psycopg2.extras
 from collections import defaultdict
 
 DB = {
@@ -17,6 +18,9 @@ test = defaultdict(list)
 
 def get_conn():
     return psycopg2.connect(**DB)
+
+def get_cursor(conn):
+    return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
 def sha256(s):
     return hashlib.sha256(s.encode()).hexdigest()
@@ -53,7 +57,7 @@ def handle_login(handler, body):
     test[username].append(now)
 
     conn = get_conn()
-    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    cur  = get_cursor(conn)
     cur.execute("SELECT * FROM admin_users WHERE username = %s", (username,))
     user = cur.fetchone()
     cur.close()
@@ -102,7 +106,7 @@ def handle_refresh(handler, body):
     token_hash = refresh_token.replace("linuxad_refresh_1_", "")
 
     conn = get_conn()
-    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    cur  = get_cursor(conn)
     cur.execute("SELECT * FROM admin_users")
     users = cur.fetchall()
     cur.close()
@@ -127,7 +131,7 @@ def handle_logout(handler, body):
 
 def handle_machines(handler):
     conn = get_conn()
-    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    cur  = get_cursor(conn)
     cur.execute("""
         SELECT m.id, m.hostname, m.fqdn, m.status, m.os_version,
                m.last_contact, a.status AS agent_status, a.ip_address
@@ -141,9 +145,94 @@ def handle_machines(handler):
     json_response(handler, 200, {"data": rows, "pagination": {"total": len(rows), "page": 1, "per_page": 20}})
 
 
+def handle_machine_detail(handler, machine_id):
+    conn = get_conn()
+    cur  = get_cursor(conn)
+    cur.execute("SELECT * FROM machines WHERE id = %s", (machine_id,))
+    machine = cur.fetchone()
+
+    if not machine:
+        cur.close()
+        conn.close()
+        return json_response(handler, 404, {"error": {"code": "NOT_FOUND", "message": "Machine non trouvee"}})
+
+    cur.execute("SELECT * FROM agents WHERE machine_id = %s", (machine_id,))
+    agent = cur.fetchone()
+
+    cur.execute("""
+        SELECT g.id, g.name FROM "groups" g
+        JOIN machine_groups mg ON mg.group_id = g.id
+        WHERE mg.machine_id = %s
+    """, (machine_id,))
+    groups = cur.fetchall()
+
+    cur.close()
+    conn.close()
+
+    json_response(handler, 200, {
+        "id":             str(machine["id"]),
+        "hostname":       machine["hostname"],
+        "fqdn":           machine["fqdn"],
+        "os_version":     machine["os_version"],
+        "kernel_version": machine["kernel_version"],
+        "status":         machine["status"],
+        "enrolled_at":    str(machine["enrolled_at"]) if machine["enrolled_at"] else None,
+        "last_contact":   str(machine["last_contact"]) if machine["last_contact"] else None,
+        "agent": {
+            "id":        str(agent["id"]) if agent else None,
+            "status":    agent["status"] if agent else "offline",
+            "version":   agent["agent_version"] if agent else None,
+            "ip_address": agent["ip_address"] if agent else None,
+            "last_seen": str(agent["last_seen"]) if agent and agent["last_seen"] else None,
+            "kernel_module_loaded": False
+        } if agent else None,
+        "groups": [{"id": str(g["id"]), "name": g["name"]} for g in groups],
+        "system_status": {
+            "uptime_seconds": 0,
+            "cpu_usage_percent": 0.0,
+            "memory_usage_percent": 0.0,
+            "disk_usage_percent": 0.0,
+            "load_average": [0.0, 0.0, 0.0]
+        },
+        "gpo_status": [],
+        "network_info": {
+            "primary_ip": agent["ip_address"] if agent else None,
+            "interfaces": []
+        }
+    })
+
+
+def handle_machine_delete(handler, machine_id):
+    conn = get_conn()
+    cur  = get_cursor(conn)
+    cur.execute("SELECT hostname FROM machines WHERE id = %s", (machine_id,))
+    machine = cur.fetchone()
+
+    if not machine:
+        cur.close()
+        conn.close()
+        return json_response(handler, 404, {"error": {"code": "NOT_FOUND", "message": "Machine non trouvee"}})
+
+    cur2 = conn.cursor()
+    cur2.execute("UPDATE agents SET status = 'revoked' WHERE machine_id = %s", (machine_id,))
+    cur2.execute("UPDATE machines SET status = 'revoked' WHERE id = %s", (machine_id,))
+    conn.commit()
+    cur.close()
+    cur2.close()
+    conn.close()
+
+    json_response(handler, 200, {
+        "id":         machine_id,
+        "hostname":   machine["hostname"],
+        "status":     "revoked",
+        "revoked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "revoked_by": "admin"
+    })
+
+
 def handle_users(handler):
     conn = get_conn()
-    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    cur  = get_cursor(conn)
     cur.execute("SELECT uid, cn, email, uid_number, home_directory, login_shell FROM users ORDER BY uid_number")
     rows = cur.fetchall()
     cur.close()
@@ -153,7 +242,7 @@ def handle_users(handler):
 
 def handle_gpo(handler):
     conn = get_conn()
-    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    cur  = get_cursor(conn)
     cur.execute("SELECT id, name, description, version, status, updated_at FROM gpo ORDER BY updated_at DESC")
     rows = cur.fetchall()
     cur.close()
@@ -163,7 +252,7 @@ def handle_gpo(handler):
 
 def handle_groups(handler):
     conn = get_conn()
-    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    cur  = get_cursor(conn)
     cur.execute('SELECT id, name, description, ldap_dn FROM "groups" ORDER BY name')
     rows = cur.fetchall()
     cur.close()
@@ -173,7 +262,7 @@ def handle_groups(handler):
 
 def handle_dashboard_stats(handler):
     conn = get_conn()
-    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    cur  = get_cursor(conn)
 
     cur.execute("SELECT status, COUNT(*) as count FROM machines GROUP BY status")
     machine_rows = {r["status"]: r["count"] for r in cur.fetchall()}
@@ -269,7 +358,7 @@ def handle_enrollment_tokens_create(handler, body):
 
 def handle_enrollment_tokens_list(handler):
     conn = get_conn()
-    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    cur  = get_cursor(conn)
     cur.execute("SELECT id, description, max_uses, current_uses, expires_at, status, created_by, created_at FROM enrollment_tokens ORDER BY created_at DESC")
     rows = cur.fetchall()
     cur.close()
@@ -282,7 +371,7 @@ def handle_enrollment_tokens_list(handler):
 
 def handle_enrollment_token_delete(handler, token_id):
     conn = get_conn()
-    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    cur  = get_cursor(conn)
     cur.execute("SELECT * FROM enrollment_tokens WHERE id = %s", (token_id,))
     token = cur.fetchone()
 
@@ -327,7 +416,7 @@ def handle_enroll(handler, body):
     token_hash = sha256(enrollment_token)
 
     conn = get_conn()
-    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    cur  = get_cursor(conn)
     cur.execute("SELECT * FROM enrollment_tokens WHERE token_hash = %s AND status = 'active'", (token_hash,))
     token = cur.fetchone()
 
@@ -392,8 +481,9 @@ def handle_agent_poll(handler, body):
 
     if not agent_id:
         return json_response(handler, 400, {"error": {"code": "VALIDATION_ERROR", "message": "agent_id requis"}})
+
     conn = get_conn()
-    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    cur  = get_cursor(conn)
     cur.execute("SELECT * FROM agents WHERE id = %s", (agent_id,))
     agent = cur.fetchone()
 
@@ -410,6 +500,7 @@ def handle_agent_poll(handler, body):
     cur.close()
     cur2.close()
     conn.close()
+
     json_response(handler, 200, {
         "commands":          [],
         "gpo_updates":       [],
@@ -437,13 +528,20 @@ def handle_agent_logs(handler, body):
     accepted = 0
     rejected = 0
     errors   = []
+
     for log in logs:
         try:
+            from datetime import datetime, timezone
+            ts_raw = log.get("timestamp", "")
+            try:
+                ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                ts = ts_raw.replace("T", " ").replace("Z", "")
             cur.execute("""
                 INSERT INTO agent_logs (id, agent_id, timestamp, level, category, message)
                 VALUES (%s, %s, %s, %s, %s, %s)
             """, (str(_uuid.uuid4()), agent_id,
-                  log.get("timestamp"), log.get("level"),
+                  ts, log.get("level"),
                   log.get("category"), log.get("message")))
             accepted += 1
         except Exception as e:
@@ -453,16 +551,20 @@ def handle_agent_logs(handler, body):
     conn.commit()
     cur.close()
     conn.close()
+
     json_response(handler, 202, {"accepted": accepted, "rejected": rejected, "errors": errors})
 
 
 def handle_agent_gpo_report(handler, body):
-    import uuid as _uuid
+    
+
     agent_id    = body.get("agent_id", "")
     gpo_id      = body.get("gpo_id", "")
     status      = body.get("status", "")
+
     if not all([agent_id, gpo_id, status]):
         return json_response(handler, 400, {"error": {"code": "VALIDATION_ERROR", "message": "Champs requis manquants"}})
+
     json_response(handler, 200, {
         "acknowledged":   True,
         "application_id": str(_uuid.uuid4())
@@ -510,11 +612,18 @@ class RelayHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/v1/enrollment/tokens/"):
             token_id = self.path.split("/")[-1]
             handle_enrollment_token_delete(self, token_id)
+        elif self.path.startswith("/api/v1/admin/machines/"):
+            machine_id = self.path.split("/")[-1]
+            handle_machine_delete(self, machine_id)
         else:
             json_response(self, 404, {"error": {"code": "NOT_FOUND", "message": f"Route {self.path} introuvable"}})
 
     def do_GET(self):
-        if self.path.startswith("/api/v1/admin/machines"):
+        if self.path == "/api/v1/admin/machines" or self.path.startswith("/api/v1/admin/machines?"):
+            handle_machines(self)
+        elif self.path.startswith("/api/v1/admin/machines/"):
+            machine_id = self.path.split("/")[5]
+            handle_machine_detail(self, machine_id)
             handle_machines(self)
         elif self.path.startswith("/api/v1/admin/users"):
             handle_users(self)
