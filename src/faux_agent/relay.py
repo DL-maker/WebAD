@@ -394,21 +394,421 @@ def handle_user_password(handler, uid, body):
 def handle_gpo(handler):
     conn = get_conn()
     cur  = get_cursor(conn)
-    cur.execute("SELECT id, name, description, version, status, updated_at FROM gpo ORDER BY updated_at DESC")
+    cur.execute("""
+        SELECT id, name, description, version, status, updated_at, created_at, signature
+        FROM gpo ORDER BY updated_at DESC
+    """)
     rows = cur.fetchall()
     cur.close()
     conn.close()
-    json_response(handler, 200, {"data": rows, "pagination": {"total": len(rows), "page": 1, "per_page": 20}})
+    data = []
+    for r in dict_rows(rows):
+        r["tags"] = []
+        r["policies_count"] = 0
+        r["assignments_count"] = 0
+        r["machines_targeted"] = 0
+        r["compliance"] = {"success": 0, "pending": 0, "failed": 0}
+        r["signed_at"] = None
+        r["signed_by"] = None
+        data.append(r)
+    json_response(handler, 200, {"data": data, "pagination": {"total": len(data), "page": 1, "per_page": 20}})
+
+
+def dict_rows(rows):
+    return [dict(r) for r in rows]
+
+
+def handle_gpo_detail(handler, gpo_id):
+    conn = get_conn()
+    cur  = get_cursor(conn)
+    cur.execute("SELECT * FROM gpo WHERE id = %s", (gpo_id,))
+    gpo = cur.fetchone()
+
+    if not gpo:
+        cur.close(); conn.close()
+        return json_response(handler, 404, {"error": {"code": "NOT_FOUND", "message": "GPO non trouvee"}})
+
+    cur.execute("SELECT * FROM gpo_assignments WHERE gpo_id = %s", (gpo_id,))
+    assignments = cur.fetchall()
+    cur.close(); conn.close()
+
+    gpo = dict(gpo)
+    json_response(handler, 200, {
+        **gpo,
+        "schema_version": "1.0",
+        "metadata": {"author": "admin", "tags": []},
+        "targeting": {"mode": "include", "groups": [], "machines": []},
+        "assignments": [dict(a) for a in assignments],
+        "deployment_status": {"total_targeted": 0, "success": 0, "pending": 0, "failed": 0, "machines": []},
+        "version_history": [{"version": gpo["version"], "updated_at": str(gpo["updated_at"]), "updated_by": "admin"}],
+        "rollback": {"enabled": True, "automatic_on_failure": True, "keep_backups": 5}
+    })
+
+
+def handle_gpo_create(handler, body):
+    import uuid as _uuid
+
+    name        = body.get("name", "")
+    description = body.get("description", "")
+    content     = body.get("content", {"schema_version": "1.0", "policies": []})
+
+    if not name:
+        return json_response(handler, 400, {"error": {"code": "VALIDATION_ERROR", "message": "Nom requis"}})
+
+    gpo_id = str(_uuid.uuid4())
+
+    conn = get_conn()
+    cur  = get_cursor(conn)
+    cur.execute("SELECT id FROM gpo WHERE name = %s", (name,))
+    if cur.fetchone():
+        cur.close(); conn.close()
+        return json_response(handler, 409, {"error": {"code": "CONFLICT", "message": "Nom de GPO deja existant"}})
+
+    import json as _json
+    cur2 = conn.cursor()
+    cur2.execute("""
+        INSERT INTO gpo (id, name, description, version, status, content, created_at, updated_at)
+        VALUES (%s, %s, %s, 1, 'draft', %s, NOW(), NOW())
+    """, (gpo_id, name, description, _json.dumps(content)))
+    conn.commit()
+    cur.close(); cur2.close(); conn.close()
+
+    json_response(handler, 201, {
+        "id": gpo_id, "name": name, "description": description,
+        "version": 1, "status": "draft", "content": content,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    })
+
+
+def handle_gpo_patch(handler, gpo_id, body):
+    conn = get_conn()
+    cur  = get_cursor(conn)
+    cur.execute("SELECT * FROM gpo WHERE id = %s", (gpo_id,))
+    gpo = cur.fetchone()
+
+    if not gpo:
+        cur.close(); conn.close()
+        return json_response(handler, 404, {"error": {"code": "NOT_FOUND", "message": "GPO non trouvee"}})
+
+    gpo = dict(gpo)
+    new_version = gpo["version"] + 1 if gpo["status"] == "active" else gpo["version"]
+
+    fields, values = [], []
+    for field in ["name", "description"]:
+        if field in body:
+            fields.append(f"{field} = %s")
+            values.append(body[field])
+
+    fields.append("status = 'draft'")
+    fields.append(f"version = {new_version}")
+    fields.append("updated_at = NOW()")
+    values.append(gpo_id)
+
+    cur2 = conn.cursor()
+    cur2.execute(f"UPDATE gpo SET {', '.join(fields)} WHERE id = %s", values)
+    conn.commit()
+
+    cur.execute("SELECT * FROM gpo WHERE id = %s", (gpo_id,))
+    updated = cur.fetchone()
+    cur.close(); cur2.close(); conn.close()
+    json_response(handler, 200, dict(updated))
+
+
+def handle_gpo_sign(handler, gpo_id):
+    conn = get_conn()
+    cur  = get_cursor(conn)
+    cur.execute("SELECT * FROM gpo WHERE id = %s", (gpo_id,))
+    gpo = cur.fetchone()
+
+    if not gpo:
+        cur.close(); conn.close()
+        return json_response(handler, 404, {"error": {"code": "NOT_FOUND", "message": "GPO non trouvee"}})
+
+    gpo = dict(gpo)
+    if gpo["status"] == "active":
+        cur.close(); conn.close()
+        return json_response(handler, 409, {"error": {"code": "CONFLICT", "message": "GPO deja active avec cette version"}})
+
+    signature = sha256(gpo["name"] + str(gpo["version"]) + "signed")
+    cur2 = conn.cursor()
+    cur2.execute("UPDATE gpo SET status = 'active', signature = %s, updated_at = NOW() WHERE id = %s",
+                 (signature, gpo_id))
+    conn.commit()
+    cur.close(); cur2.close(); conn.close()
+
+    json_response(handler, 200, {
+        "id": gpo_id, "name": gpo["name"], "version": gpo["version"],
+        "status": "active", "signature": signature,
+        "signed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "signed_by": "admin"
+    })
+
+
+def handle_gpo_assignments(handler, gpo_id, body):
+    import uuid as _uuid
+
+    assignments = body.get("assignments", [])
+
+    conn = get_conn()
+    cur  = get_cursor(conn)
+    cur.execute("SELECT id FROM gpo WHERE id = %s", (gpo_id,))
+    if not cur.fetchone():
+        cur.close(); conn.close()
+        return json_response(handler, 404, {"error": {"code": "NOT_FOUND", "message": "GPO non trouvee"}})
+
+    cur2 = conn.cursor()
+    created = 0
+    for a in assignments:
+        cur2.execute("""
+            INSERT INTO gpo_assignments (id, gpo_id, target_type, priority, enabled)
+            VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING
+        """, (str(_uuid.uuid4()), gpo_id,
+              a.get("target_type", "all"),
+              a.get("priority", 100),
+              a.get("enabled", True)))
+        created += cur2.rowcount
+
+    conn.commit()
+    cur.execute("SELECT COUNT(*) AS total FROM machines")
+    total = cur.fetchone()["total"]
+    cur.close(); cur2.close(); conn.close()
+
+    json_response(handler, 200, {
+        "gpo_id": gpo_id,
+        "assignments_created": created,
+        "machines_targeted": total
+    })
+
+
+def handle_gpo_status(handler, gpo_id):
+    conn = get_conn()
+    cur  = get_cursor(conn)
+    cur.execute("SELECT * FROM gpo WHERE id = %s", (gpo_id,))
+    gpo = cur.fetchone()
+
+    if not gpo:
+        cur.close(); conn.close()
+        return json_response(handler, 404, {"error": {"code": "NOT_FOUND", "message": "GPO non trouvee"}})
+
+    gpo = dict(gpo)
+    cur.execute("SELECT COUNT(*) AS total FROM machines")
+    total = cur.fetchone()["total"]
+    cur.close(); conn.close()
+
+    json_response(handler, 200, {
+        "gpo_id": gpo_id, "gpo_name": gpo["name"],
+        "version": gpo["version"], "status": gpo["status"],
+        "deployment": {"total_targeted": total, "applied_success": 0, "applied_pending": total, "applied_failed": 0, "not_seen": 0},
+        "machines": []
+    })
+
+
+def handle_gpo_rollback(handler, gpo_id, body):
+    import uuid as _uuid
+
+    target_version = body.get("target_version")
+    reason         = body.get("reason", "")
+
+    if not target_version:
+        return json_response(handler, 400, {"error": {"code": "VALIDATION_ERROR", "message": "target_version requis"}})
+
+    conn = get_conn()
+    cur  = get_cursor(conn)
+    cur.execute("SELECT * FROM gpo WHERE id = %s", (gpo_id,))
+    gpo = cur.fetchone()
+
+    if not gpo:
+        cur.close(); conn.close()
+        return json_response(handler, 404, {"error": {"code": "NOT_FOUND", "message": "GPO non trouvee"}})
+
+    gpo = dict(gpo)
+    cur.execute("SELECT COUNT(*) AS total FROM machines")
+    total = cur.fetchone()["total"]
+    cur.close(); conn.close()
+
+    rollback_id = str(_uuid.uuid4())
+    json_response(handler, 202, {
+        "rollback_id": rollback_id, "gpo_id": gpo_id,
+        "from_version": gpo["version"], "to_version": target_version,
+        "machines_targeted": total, "status": "in_progress",
+        "initiated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "initiated_by": "admin"
+    })
+
+
+def handle_gpo_rollback_status(handler, gpo_id, rollback_id):
+    json_response(handler, 200, {
+        "rollback_id": rollback_id, "gpo_id": gpo_id,
+        "status": "completed", "machines_targeted": 0,
+        "machines_completed": 0, "machines_failed": 0,
+        "initiated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "initiated_by": "admin", "failed_machines": []
+    })
+
+
+def handle_gpo_test(handler, gpo_id, body):
+    import uuid as _uuid
+    test_id = str(_uuid.uuid4())
+    machines = body.get("machines", [])
+    json_response(handler, 202, {
+        "test_id": test_id, "gpo_id": gpo_id,
+        "status": "pending", "machines_targeted": len(machines) or 1,
+        "initiated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    })
+
+
+def handle_gpo_test_status(handler, gpo_id, test_id):
+    json_response(handler, 200, {
+        "test_id": test_id, "gpo_id": gpo_id,
+        "status": "completed", "machines_targeted": 1,
+        "initiated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "results": []
+    })
+
+
+
 
 
 def handle_groups(handler):
     conn = get_conn()
     cur  = get_cursor(conn)
-    cur.execute('SELECT id, name, description, ldap_dn FROM "groups" ORDER BY name')
+    cur.execute("""
+        SELECT g.id, g.name, g.description, g.ldap_dn,
+               COUNT(DISTINCT mg.machine_id) AS machine_count,
+               COUNT(DISTINCT ga.id) AS gpo_count
+        FROM "groups" g
+        LEFT JOIN machine_groups mg ON mg.group_id = g.id
+        LEFT JOIN gpo_assignments ga ON ga.target_type = 'group'
+        GROUP BY g.id, g.name, g.description, g.ldap_dn
+        ORDER BY g.name
+    """)
     rows = cur.fetchall()
     cur.close()
     conn.close()
     json_response(handler, 200, {"data": rows, "pagination": {"total": len(rows), "page": 1, "per_page": 20}})
+
+
+def handle_group_create(handler, body):
+    import uuid as _uuid
+    name        = body.get("name", "")
+    description = body.get("description", "")
+
+    if not name or len(name) < 3:
+        return json_response(handler, 400, {"error": {"code": "VALIDATION_ERROR", "message": "Nom requis (min 3 chars)"}})
+
+    group_id = str(_uuid.uuid4())
+    ldap_dn  = f"cn={name},ou=Groups,dc=linuxad,dc=local"
+
+    conn = get_conn()
+    cur  = get_cursor(conn)
+    cur.execute('SELECT id FROM "groups" WHERE name = %s', (name,))
+    if cur.fetchone():
+        cur.close()
+        conn.close()
+        return json_response(handler, 409, {"error": {"code": "CONFLICT", "message": "Nom de groupe deja existant"}})
+
+    cur2 = conn.cursor()
+    cur2.execute('INSERT INTO "groups" (id, name, description, ldap_dn) VALUES (%s, %s, %s, %s)',
+                 (group_id, name, description, ldap_dn))
+    conn.commit()
+    cur.close()
+    cur2.close()
+    conn.close()
+
+    json_response(handler, 201, {
+        "id": group_id, "name": name, "description": description,
+        "ldap_dn": ldap_dn, "machine_count": 0, "gpo_count": 0,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    })
+
+
+def handle_group_patch(handler, group_id, body):
+    conn = get_conn()
+    cur  = get_cursor(conn)
+    cur.execute('SELECT * FROM "groups" WHERE id = %s', (group_id,))
+    group = cur.fetchone()
+    if not group:
+        cur.close(); conn.close()
+        return json_response(handler, 404, {"error": {"code": "NOT_FOUND", "message": "Groupe non trouve"}})
+
+    fields, values = [], []
+    for field in ["name", "description"]:
+        if field in body:
+            fields.append(f"{field} = %s")
+            values.append(body[field])
+    if fields:
+        values.append(group_id)
+        cur2 = conn.cursor()
+        cur2.execute(f'UPDATE "groups" SET {", ".join(fields)} WHERE id = %s', values)
+        conn.commit()
+        cur2.close()
+
+    cur.execute('SELECT * FROM "groups" WHERE id = %s', (group_id,))
+    updated = cur.fetchone()
+    cur.close(); conn.close()
+    json_response(handler, 200, dict(updated))
+
+
+def handle_group_delete(handler, group_id):
+    conn = get_conn()
+    cur  = get_cursor(conn)
+    cur.execute('SELECT name FROM "groups" WHERE id = %s', (group_id,))
+    group = cur.fetchone()
+    if not group:
+        cur.close(); conn.close()
+        return json_response(handler, 404, {"error": {"code": "NOT_FOUND", "message": "Groupe non trouve"}})
+
+    cur2 = conn.cursor()
+    cur2.execute("DELETE FROM machine_groups WHERE group_id = %s", (group_id,))
+    cur2.execute('DELETE FROM "groups" WHERE id = %s', (group_id,))
+    conn.commit()
+    cur.close(); cur2.close(); conn.close()
+
+    json_response(handler, 200, {
+        "id": group_id, "name": group["name"],
+        "deleted": True, "deleted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    })
+
+
+def handle_group_members(handler, group_id, body):
+    add    = body.get("add", [])
+    remove = body.get("remove", [])
+
+    conn = get_conn()
+    cur  = get_cursor(conn)
+    cur.execute('SELECT name FROM "groups" WHERE id = %s', (group_id,))
+    group = cur.fetchone()
+    if not group:
+        cur.close(); conn.close()
+        return json_response(handler, 404, {"error": {"code": "NOT_FOUND", "message": "Groupe non trouve"}})
+
+    cur2 = conn.cursor()
+    added = removed = 0
+    for machine_id in add:
+        try:
+            cur2.execute("INSERT INTO machine_groups (machine_id, group_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                         (machine_id, group_id))
+            added += cur2.rowcount
+        except Exception:
+            pass
+    for machine_id in remove:
+        cur2.execute("DELETE FROM machine_groups WHERE machine_id = %s AND group_id = %s", (machine_id, group_id))
+        removed += cur2.rowcount
+    conn.commit()
+
+    cur.execute("SELECT COUNT(*) AS total FROM machine_groups WHERE group_id = %s", (group_id,))
+    total = cur.fetchone()["total"]
+    cur.close(); cur2.close(); conn.close()
+
+    json_response(handler, 200, {
+        "group_id": group_id, "group_name": group["name"],
+        "added": added, "removed": removed, "total_members": total
+    })
+
+
 
 
 def handle_dashboard_stats(handler):
@@ -424,7 +824,7 @@ def handle_dashboard_stats(handler):
     cur.execute("SELECT COUNT(*) as count FROM users")
     user_count = cur.fetchone()["count"]
 
-    cur.execute('SELECT COUNT(*) as count FROM "groups"')
+    cur.execute("SELECT COUNT(*) as count FROM 'groups'")
     group_count = cur.fetchone()["count"]
 
     cur.execute("SELECT status, COUNT(*) as count FROM gpo GROUP BY status")
@@ -761,6 +1161,25 @@ class RelayHandler(BaseHTTPRequestHandler):
             handle_user_password(self, uid, body)
         elif self.path == "/api/v1/admin/users":
             handle_user_create(self, body)
+        elif self.path == "/api/v1/admin/groups":
+            handle_group_create(self, body)
+        elif self.path.startswith("/api/v1/admin/groups/") and self.path.endswith("/members"):
+            group_id = self.path.split("/")[5]
+            handle_group_members(self, group_id, body)
+        elif self.path == "/api/v1/admin/gpo":
+            handle_gpo_create(self, body)
+        elif self.path.startswith("/api/v1/admin/gpo/") and self.path.endswith("/sign"):
+            gpo_id = self.path.split("/")[5]
+            handle_gpo_sign(self, gpo_id)
+        elif self.path.startswith("/api/v1/admin/gpo/") and self.path.endswith("/assignments"):
+            gpo_id = self.path.split("/")[5]
+            handle_gpo_assignments(self, gpo_id, body)
+        elif self.path.startswith("/api/v1/admin/gpo/") and self.path.endswith("/rollback"):
+            gpo_id = self.path.split("/")[5]
+            handle_gpo_rollback(self, gpo_id, body)
+        elif self.path.startswith("/api/v1/admin/gpo/") and "/test" in self.path and not self.path.split("/test/")[-1]:
+            gpo_id = self.path.split("/")[5]
+            handle_gpo_test(self, gpo_id, body)
         else:
             json_response(self, 404, {"error": {"code": "NOT_FOUND", "message": f"Route {self.path} introuvable"}})
 
@@ -774,6 +1193,9 @@ class RelayHandler(BaseHTTPRequestHandler):
         elif self.path.startswith("/api/v1/admin/users/"):
             uid = self.path.split("/")[5]
             handle_user_delete(self, uid)
+        elif self.path.startswith("/api/v1/admin/groups/"):
+            group_id = self.path.split("/")[5]
+            handle_group_delete(self, group_id)
         else:
             json_response(self, 404, {"error": {"code": "NOT_FOUND", "message": f"Route {self.path} introuvable"}})
 
@@ -784,6 +1206,12 @@ class RelayHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/v1/admin/users/"):
             uid = self.path.split("/")[5]
             handle_user_patch(self, uid, body)
+        elif self.path.startswith("/api/v1/admin/groups/"):
+            group_id = self.path.split("/")[5]
+            handle_group_patch(self, group_id, body)
+        elif self.path.startswith("/api/v1/admin/gpo/"):
+            gpo_id = self.path.split("/")[5]
+            handle_gpo_patch(self, gpo_id, body)
         else:
             json_response(self, 404, {"error": {"code": "NOT_FOUND", "message": f"Route {self.path} introuvable"}})
 
@@ -798,9 +1226,24 @@ class RelayHandler(BaseHTTPRequestHandler):
         elif self.path.startswith("/api/v1/admin/users/"):
             uid = self.path.split("/")[5]
             handle_user_detail(self, uid)
-        elif self.path.startswith("/api/v1/admin/gpo"):
+        elif self.path == "/api/v1/admin/gpo" or self.path.startswith("/api/v1/admin/gpo?"):
             handle_gpo(self)
-        elif self.path.startswith("/api/v1/admin/groups"):
+        elif self.path.startswith("/api/v1/admin/gpo/"):
+            parts = self.path.split("/")
+            gpo_id = parts[5]
+            if len(parts) == 6:
+                handle_gpo_detail(self, gpo_id)
+            elif parts[-1] == "status":
+                handle_gpo_status(self, gpo_id)
+            elif len(parts) >= 8 and parts[6] == "rollback":
+                handle_gpo_rollback_status(self, gpo_id, parts[7])
+            elif len(parts) >= 8 and parts[6] == "test":
+                handle_gpo_test_status(self, gpo_id, parts[7])
+            else:
+                json_response(self, 404, {"error": {"code": "NOT_FOUND", "message": f"Route {self.path} introuvable"}})
+        elif self.path == "/api/v1/admin/groups" or self.path.startswith("/api/v1/admin/groups?"):
+            handle_groups(self)
+        elif self.path.startswith("/api/v1/admin/groups/"):
             handle_groups(self)
         elif self.path.startswith("/api/v1/admin/dashboard/stats"):
             handle_dashboard_stats(self)
