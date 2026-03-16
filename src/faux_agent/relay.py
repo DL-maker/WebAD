@@ -809,95 +809,6 @@ def handle_group_members(handler, group_id, body):
     })
 
 
-
-
-def handle_logs_agents(handler):
-    conn = get_conn()
-    cur  = get_cursor(conn)
-    cur.execute("""
-        SELECT al.id, al.agent_id, a.machine_id, m.hostname,
-               al.timestamp, al.level, al.category, al.message,
-               al.timestamp AS received_at
-        FROM agent_logs al
-        LEFT JOIN agents a ON a.id = al.agent_id
-        LEFT JOIN machines m ON m.id = a.machine_id
-        ORDER BY al.timestamp DESC
-        LIMIT 50
-    """)
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-
-    data = []
-    for r in rows:
-        r = dict(r)
-        r["details"] = {}
-        data.append(r)
-
-    json_response(handler, 200, {"data": data, "pagination": {"total": len(data), "page": 1, "per_page": 50}})
-
-
-def handle_logs_audit(handler):
-    conn = get_conn()
-    cur  = get_cursor(conn)
-    cur.execute("""
-        SELECT al.id, al.actor_type, al.actor_id,
-               au.username AS actor_username,
-               al.timestamp, al.action, al.resource_type,
-               al.ip_address
-        FROM audit_logs al
-        LEFT JOIN admin_users au ON au.id::text = al.actor_id::text
-        ORDER BY al.timestamp DESC
-        LIMIT 50
-    """)
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-
-    data = []
-    for r in rows:
-        r = dict(r)
-        r["resource_id"] = None
-        r["resource_name"] = None
-        r["details"] = {}
-        data.append(r)
-
-    json_response(handler, 200, {"data": data, "pagination": {"total": len(data), "page": 1, "per_page": 50}})
-
-
-def handle_logs_agents(handler):
-    conn = get_conn()
-    cur  = get_cursor(conn)
-    cur.execute("""
-        SELECT l.id, l.agent_id, l.timestamp, l.level, l.category, l.message,
-               m.hostname, m.id AS machine_id
-        FROM agent_logs l
-        LEFT JOIN agents a ON a.id = l.agent_id
-        LEFT JOIN machines m ON m.id = a.machine_id
-        ORDER BY l.timestamp DESC
-        LIMIT 100
-    """)
-    rows = [dict(r) for r in cur.fetchall()]
-    cur.close()
-    conn.close()
-    json_response(handler, 200, {"data": rows, "pagination": {"total": len(rows), "page": 1, "per_page": 50}})
-
-
-def handle_logs_audit(handler):
-    conn = get_conn()
-    cur  = get_cursor(conn)
-    cur.execute("""
-        SELECT id, actor_type, actor_id, action, resource_type, ip_address, timestamp
-        FROM audit_logs
-        ORDER BY timestamp DESC
-        LIMIT 100
-    """)
-    rows = [dict(r) for r in cur.fetchall()]
-    cur.close()
-    conn.close()
-    json_response(handler, 200, {"data": rows, "pagination": {"total": len(rows), "page": 1, "per_page": 50}})
-
-
 def handle_dashboard_stats(handler):
     conn = get_conn()
     cur  = get_cursor(conn)
@@ -1261,6 +1172,79 @@ def handle_logs_audit(handler):
     json_response(handler, 200, {"data": rows, "pagination": {"total": len(rows), "page": 1, "per_page": 50}})
 
 
+# ── Settings ─────────────────────────────────────────────────
+
+def handle_settings_get(handler):
+    conn = get_conn()
+    cur  = get_cursor(conn)
+    cur.execute("SELECT key, value FROM settings ORDER BY key")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    result = {r["key"]: r["value"] for r in rows}
+    json_response(handler, 200, result)
+
+
+def handle_settings_put(handler, body):
+    import json as _json
+    conn = get_conn()
+    cur  = conn.cursor()
+    cur2 = get_cursor(conn)
+
+    for section, values in body.items():
+        if not isinstance(values, dict):
+            continue
+        cur2.execute("SELECT value FROM settings WHERE key = %s", (section,))
+        existing = cur2.fetchone()
+        if existing:
+            merged = dict(existing["value"])
+            merged.update(values)
+            cur.execute("UPDATE settings SET value = %s WHERE key = %s",
+                        (_json.dumps(merged), section))
+        else:
+            cur.execute("INSERT INTO settings (key, value) VALUES (%s, %s)",
+                        (section, _json.dumps(values)))
+
+    conn.commit()
+    cur.close()
+    cur2.close()
+    conn.close()
+    handle_settings_get(handler)
+
+def handle_secrets_rotate(handler, body):
+    import uuid as _uuid
+    secret_type = body.get("secret_type", "")
+    if secret_type not in ["gpo_signing_key", "jwt_secret", "agent_secrets_all"]:
+        return json_response(handler, 400, {"error": {"code": "VALIDATION_ERROR", "message": "secret_type invalide"}})
+    json_response(handler, 202, {
+        "rotation_id":  str(_uuid.uuid4()),
+        "secret_type":  secret_type,
+        "status":       "in_progress",
+        "initiated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "initiated_by": "admin"
+    })
+
+def handle_machine_rotate_secret(handler, machine_id, body):
+    import uuid as _uuid
+    conn = get_conn()
+    cur  = get_cursor(conn)
+    cur.execute("SELECT id FROM agents WHERE machine_id = %s", (machine_id,))
+    agent = cur.fetchone()
+    cur.close(); conn.close()
+
+    if not agent:
+        return json_response(handler, 404, {"error": {"code": "NOT_FOUND", "message": "Machine ou agent non trouve"}})
+
+    json_response(handler, 202, {
+        "machine_id":      machine_id,
+        "agent_id":        str(agent["id"]),
+        "rotation_status": "pending",
+        "immediate":       body.get("immediate", False),
+        "initiated_at":    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "initiated_by":    "admin"
+    })
+
+
 # ── Handler HTTP ──────────────────────────────────────────────
 
 class RelayHandler(BaseHTTPRequestHandler):
@@ -1316,9 +1300,11 @@ class RelayHandler(BaseHTTPRequestHandler):
         elif self.path.startswith("/api/v1/admin/gpo/") and self.path.endswith("/rollback"):
             gpo_id = self.path.split("/")[5]
             handle_gpo_rollback(self, gpo_id, body)
-        elif self.path.startswith("/api/v1/admin/gpo/") and "/test" in self.path and not self.path.split("/test/")[-1]:
-            gpo_id = self.path.split("/")[5]
-            handle_gpo_test(self, gpo_id, body)
+        elif self.path == "/api/v1/admin/secrets/rotate":
+            handle_secrets_rotate(self, body)
+        elif self.path.startswith("/api/v1/admin/machines/") and self.path.endswith("/rotate-secret"):
+            machine_id = self.path.split("/")[5]
+            handle_machine_rotate_secret(self, machine_id, body)
         else:
             json_response(self, 404, {"error": {"code": "NOT_FOUND", "message": f"Route {self.path} introuvable"}})
 
@@ -1351,6 +1337,14 @@ class RelayHandler(BaseHTTPRequestHandler):
         elif self.path.startswith("/api/v1/admin/gpo/"):
             gpo_id = self.path.split("/")[5]
             handle_gpo_patch(self, gpo_id, body)
+        else:
+            json_response(self, 404, {"error": {"code": "NOT_FOUND", "message": f"Route {self.path} introuvable"}})
+
+    def do_PUT(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body   = json.loads(self.rfile.read(length)) if length else {}
+        if self.path == "/api/v1/admin/settings":
+            handle_settings_put(self, body)
         else:
             json_response(self, 404, {"error": {"code": "NOT_FOUND", "message": f"Route {self.path} introuvable"}})
 
@@ -1388,10 +1382,9 @@ class RelayHandler(BaseHTTPRequestHandler):
             handle_logs_agents(self)
         elif self.path.startswith("/api/v1/admin/logs/audit"):
             handle_logs_audit(self)
-        elif self.path.startswith("/api/v1/admin/logs/agents"):
-            handle_logs_agents(self)
-        elif self.path.startswith("/api/v1/admin/logs/audit"):
-            handle_logs_audit(self)
+        elif self.path == "/api/v1/admin/settings":
+            handle_settings_get(self)
+        elif self.path.startswith("/api/v1/admin/dashboard/stats"):
             handle_dashboard_stats(self)
         elif self.path.startswith("/api/v1/enrollment/tokens"):
             handle_enrollment_tokens_list(self)

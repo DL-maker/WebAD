@@ -105,6 +105,11 @@ CREATE TABLE IF NOT EXISTS machine_groups (
     FOREIGN KEY (group_id)   REFERENCES "groups"(id)
 );
 
+CREATE TABLE IF NOT EXISTS settings (
+    key   VARCHAR(100) PRIMARY KEY,
+    value JSONB        NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS enrollment_tokens (
     id           VARCHAR(36)  PRIMARY KEY,
     token_hash   VARCHAR(64)  NOT NULL,
