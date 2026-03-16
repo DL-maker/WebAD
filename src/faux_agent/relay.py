@@ -811,6 +811,93 @@ def handle_group_members(handler, group_id, body):
 
 
 
+def handle_logs_agents(handler):
+    conn = get_conn()
+    cur  = get_cursor(conn)
+    cur.execute("""
+        SELECT al.id, al.agent_id, a.machine_id, m.hostname,
+               al.timestamp, al.level, al.category, al.message,
+               al.timestamp AS received_at
+        FROM agent_logs al
+        LEFT JOIN agents a ON a.id = al.agent_id
+        LEFT JOIN machines m ON m.id = a.machine_id
+        ORDER BY al.timestamp DESC
+        LIMIT 50
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    data = []
+    for r in rows:
+        r = dict(r)
+        r["details"] = {}
+        data.append(r)
+
+    json_response(handler, 200, {"data": data, "pagination": {"total": len(data), "page": 1, "per_page": 50}})
+
+
+def handle_logs_audit(handler):
+    conn = get_conn()
+    cur  = get_cursor(conn)
+    cur.execute("""
+        SELECT al.id, al.actor_type, al.actor_id,
+               au.username AS actor_username,
+               al.timestamp, al.action, al.resource_type,
+               al.ip_address
+        FROM audit_logs al
+        LEFT JOIN admin_users au ON au.id::text = al.actor_id::text
+        ORDER BY al.timestamp DESC
+        LIMIT 50
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    data = []
+    for r in rows:
+        r = dict(r)
+        r["resource_id"] = None
+        r["resource_name"] = None
+        r["details"] = {}
+        data.append(r)
+
+    json_response(handler, 200, {"data": data, "pagination": {"total": len(data), "page": 1, "per_page": 50}})
+
+
+def handle_logs_agents(handler):
+    conn = get_conn()
+    cur  = get_cursor(conn)
+    cur.execute("""
+        SELECT l.id, l.agent_id, l.timestamp, l.level, l.category, l.message,
+               m.hostname, m.id AS machine_id
+        FROM agent_logs l
+        LEFT JOIN agents a ON a.id = l.agent_id
+        LEFT JOIN machines m ON m.id = a.machine_id
+        ORDER BY l.timestamp DESC
+        LIMIT 100
+    """)
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close()
+    conn.close()
+    json_response(handler, 200, {"data": rows, "pagination": {"total": len(rows), "page": 1, "per_page": 50}})
+
+
+def handle_logs_audit(handler):
+    conn = get_conn()
+    cur  = get_cursor(conn)
+    cur.execute("""
+        SELECT id, actor_type, actor_id, action, resource_type, ip_address, timestamp
+        FROM audit_logs
+        ORDER BY timestamp DESC
+        LIMIT 100
+    """)
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close()
+    conn.close()
+    json_response(handler, 200, {"data": rows, "pagination": {"total": len(rows), "page": 1, "per_page": 50}})
+
+
 def handle_dashboard_stats(handler):
     conn = get_conn()
     cur  = get_cursor(conn)
@@ -1122,6 +1209,58 @@ def handle_agent_gpo_report(handler, body):
     })
 
 
+# ── Logs ─────────────────────────────────────────────────────
+
+def handle_logs_agents(handler):
+    conn = get_conn()
+    cur  = get_cursor(conn)
+    cur.execute("""
+        SELECT al.id, al.agent_id, a.machine_id, m.hostname,
+               al.timestamp, al.level, al.category, al.message,
+               al.timestamp AS received_at
+        FROM agent_logs al
+        LEFT JOIN agents a ON a.id = al.agent_id
+        LEFT JOIN machines m ON m.id = a.machine_id
+        ORDER BY al.timestamp DESC
+        LIMIT 50
+    """)
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close()
+    conn.close()
+
+    for r in rows:
+        r["details"] = {}
+        for k in ["timestamp", "received_at"]:
+            if r.get(k):
+                r[k] = str(r[k])
+
+    json_response(handler, 200, {"data": rows, "pagination": {"total": len(rows), "page": 1, "per_page": 50}})
+
+
+def handle_logs_audit(handler):
+    conn = get_conn()
+    cur  = get_cursor(conn)
+    cur.execute("""
+        SELECT id, actor_type, actor_id, action, resource_type, ip_address, timestamp
+        FROM audit_logs
+        ORDER BY timestamp DESC
+        LIMIT 50
+    """)
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close()
+    conn.close()
+
+    for r in rows:
+        r["actor_username"] = "admin"
+        r["resource_id"]    = None
+        r["resource_name"]  = None
+        r["details"]        = {}
+        if r.get("timestamp"):
+            r["timestamp"] = str(r["timestamp"])
+
+    json_response(handler, 200, {"data": rows, "pagination": {"total": len(rows), "page": 1, "per_page": 50}})
+
+
 # ── Handler HTTP ──────────────────────────────────────────────
 
 class RelayHandler(BaseHTTPRequestHandler):
@@ -1245,7 +1384,14 @@ class RelayHandler(BaseHTTPRequestHandler):
             handle_groups(self)
         elif self.path.startswith("/api/v1/admin/groups/"):
             handle_groups(self)
-        elif self.path.startswith("/api/v1/admin/dashboard/stats"):
+        elif self.path.startswith("/api/v1/admin/logs/agents"):
+            handle_logs_agents(self)
+        elif self.path.startswith("/api/v1/admin/logs/audit"):
+            handle_logs_audit(self)
+        elif self.path.startswith("/api/v1/admin/logs/agents"):
+            handle_logs_agents(self)
+        elif self.path.startswith("/api/v1/admin/logs/audit"):
+            handle_logs_audit(self)
             handle_dashboard_stats(self)
         elif self.path.startswith("/api/v1/enrollment/tokens"):
             handle_enrollment_tokens_list(self)
