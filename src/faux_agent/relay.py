@@ -24,8 +24,21 @@ def get_cursor(conn):
 def sha256(s):
     return hashlib.sha256(s.encode()).hexdigest()
 
-def faux_jwt(username, role):
-    return f"eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.{sha256(username + role)[:32]}"
+import jwt as _jwt
+
+JWT_SECRET = "linuxad_dev_secret_key_change_in_prod"
+JWT_ALGO   = "HS256"
+
+def make_jwt(username: str, role: str, user_id: str) -> str:
+    import time as _time
+    payload = {
+        "sub":      user_id,
+        "username": username,
+        "role":     role,
+        "iat":      int(_time.time()),
+        "exp":      int(_time.time()) + 3600
+    }
+    return _jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
 
 def json_response(handler, code, data):
     body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
@@ -78,7 +91,7 @@ def handle_login(handler, body):
     cur.close()
     conn.close()
 
-    access_token  = faux_jwt(username, user["role"])
+    access_token  = make_jwt(username, user["role"], str(user["id"]))
     refresh_token = f"linuxad_refresh_1_{sha256(username)[:12]}"
 
     json_response(handler, 200, {
@@ -117,7 +130,7 @@ def handle_refresh(handler, body):
         return json_response(handler, 401, {"error": {"code": "INVALID_TOKEN", "message": "Refresh token invalide"}})
 
     json_response(handler, 200, {
-        "access_token": faux_jwt(user["username"], user["role"]),
+        "access_token": make_jwt(user["username"], user["role"], str(user["id"])),
         "token_type":   "bearer",
         "expires_in":   3600
     })
@@ -809,6 +822,8 @@ def handle_group_members(handler, group_id, body):
     })
 
 
+
+
 def handle_dashboard_stats(handler):
     conn = get_conn()
     cur  = get_cursor(conn)
@@ -1211,6 +1226,178 @@ def handle_settings_put(handler, body):
     conn.close()
     handle_settings_get(handler)
 
+# ── Admin Users ───────────────────────────────────────────────
+
+def handle_admin_users_list(handler):
+    conn = get_conn()
+    cur  = get_cursor(conn)
+    cur.execute("SELECT id, username, email, role, mfa_enabled, last_login, created_at FROM admin_users ORDER BY created_at")
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close(); conn.close()
+    json_response(handler, 200, {"data": rows, "pagination": {"total": len(rows), "page": 1, "per_page": 20}})
+
+
+def handle_admin_users_create(handler, body):
+    import uuid as _uuid
+    username = body.get("username", "")
+    email    = body.get("email", "")
+    password = body.get("password", "")
+    role     = body.get("role", "")
+
+    if not all([username, email, password, role]):
+        return json_response(handler, 400, {"error": {"code": "VALIDATION_ERROR", "message": "Champs requis manquants"}})
+    if len(password) < 12:
+        return json_response(handler, 400, {"error": {"code": "VALIDATION_ERROR", "message": "Mot de passe trop court (min 12 chars)"}})
+    if role not in ["superadmin", "admin", "operator", "viewer"]:
+        return json_response(handler, 400, {"error": {"code": "VALIDATION_ERROR", "message": "Role invalide"}})
+
+    conn = get_conn()
+    cur  = get_cursor(conn)
+    cur.execute("SELECT id FROM admin_users WHERE username = %s OR email = %s", (username, email))
+    if cur.fetchone():
+        cur.close(); conn.close()
+        return json_response(handler, 409, {"error": {"code": "CONFLICT", "message": "Username ou email deja pris"}})
+
+    admin_id = str(_uuid.uuid4())
+    cur2 = conn.cursor()
+    cur2.execute("""
+        INSERT INTO admin_users (id, username, email, password_hash, role, mfa_enabled)
+        VALUES (%s, %s, %s, %s, %s, FALSE)
+    """, (admin_id, username, email, sha256(password), role))
+    conn.commit()
+    cur.close(); cur2.close(); conn.close()
+
+    json_response(handler, 201, {
+        "id": admin_id, "username": username, "email": email,
+        "role": role, "mfa_enabled": False,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    })
+
+
+def handle_admin_users_patch(handler, admin_id, body):
+    conn = get_conn()
+    cur  = get_cursor(conn)
+    cur.execute("SELECT * FROM admin_users WHERE id = %s", (admin_id,))
+    user = cur.fetchone()
+    if not user:
+        cur.close(); conn.close()
+        return json_response(handler, 404, {"error": {"code": "NOT_FOUND", "message": "Admin non trouve"}})
+
+    user = dict(user)
+
+    # Protection dernier superadmin
+    if "role" in body and user["role"] == "superadmin" and body["role"] != "superadmin":
+        cur.execute("SELECT COUNT(*) AS count FROM admin_users WHERE role = 'superadmin'")
+        if cur.fetchone()["count"] <= 1:
+            cur.close(); conn.close()
+            return json_response(handler, 409, {"error": {"code": "CONFLICT", "message": "Impossible de retrograder le dernier superadmin"}})
+
+    fields, values = [], []
+    for field in ["email", "role"]:
+        if field in body:
+            fields.append(f"{field} = %s")
+            values.append(body[field])
+    if "password" in body:
+        fields.append("password_hash = %s")
+        values.append(sha256(body["password"]))
+
+    if fields:
+        values.append(admin_id)
+        cur2 = conn.cursor()
+        cur2.execute(f"UPDATE admin_users SET {', '.join(fields)} WHERE id = %s", values)
+        conn.commit()
+        cur2.close()
+
+    cur.execute("SELECT id, username, email, role, mfa_enabled, last_login, created_at FROM admin_users WHERE id = %s", (admin_id,))
+    updated = cur.fetchone()
+    cur.close(); conn.close()
+    json_response(handler, 200, dict(updated))
+
+
+def handle_admin_users_delete(handler, admin_id):
+    conn = get_conn()
+    cur  = get_cursor(conn)
+    cur.execute("SELECT username, role FROM admin_users WHERE id = %s", (admin_id,))
+    user = cur.fetchone()
+    if not user:
+        cur.close(); conn.close()
+        return json_response(handler, 404, {"error": {"code": "NOT_FOUND", "message": "Admin non trouve"}})
+
+    user = dict(user)
+    if user["role"] == "superadmin":
+        cur.execute("SELECT COUNT(*) AS count FROM admin_users WHERE role = 'superadmin'")
+        if cur.fetchone()["count"] <= 1:
+            cur.close(); conn.close()
+            return json_response(handler, 409, {"error": {"code": "CONFLICT", "message": "Impossible de supprimer le dernier superadmin"}})
+
+    cur2 = conn.cursor()
+    cur2.execute("DELETE FROM admin_users WHERE id = %s", (admin_id,))
+    conn.commit()
+    cur.close(); cur2.close(); conn.close()
+
+    json_response(handler, 200, {
+        "id": admin_id, "username": user["username"],
+        "deleted": True, "deleted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "deleted_by": "admin"
+    })
+
+
+def handle_admin_mfa_setup(handler, admin_id):
+    import random as _random
+    import string as _string
+    import pyotp
+
+    conn = get_conn()
+    cur  = get_cursor(conn)
+    cur.execute("SELECT username FROM admin_users WHERE id = %s", (admin_id,))
+    user = cur.fetchone()
+    cur.close(); conn.close()
+
+    if not user:
+        return json_response(handler, 404, {"error": {"code": "NOT_FOUND", "message": "Admin non trouve"}})
+
+    secret = pyotp.random_base32()
+    totp   = pyotp.TOTP(secret)
+    backup_codes = ["".join(_random.choices(_string.ascii_uppercase + _string.digits, k=8)) for _ in range(5)]
+
+    json_response(handler, 200, {
+        "secret":      secret,
+        "qr_code_uri": totp.provisioning_uri(name=user["username"], issuer_name="LinuxAD"),
+        "backup_codes": backup_codes
+    })
+
+
+def handle_admin_mfa_verify(handler, admin_id, body):
+    code = body.get("code", "")
+    if len(str(code)) != 6:
+        return json_response(handler, 401, {"error": {"code": "INVALID_MFA", "message": "Code MFA invalide"}})
+
+    conn = get_conn()
+    cur  = conn.cursor()
+    cur.execute("UPDATE admin_users SET mfa_enabled = TRUE WHERE id = %s", (admin_id,))
+    conn.commit()
+    cur.close(); conn.close()
+
+    json_response(handler, 200, {
+        "mfa_enabled": True,
+        "verified_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    })
+
+
+def handle_admin_mfa_disable(handler, admin_id):
+    conn = get_conn()
+    cur  = conn.cursor()
+    cur.execute("UPDATE admin_users SET mfa_enabled = FALSE WHERE id = %s", (admin_id,))
+    conn.commit()
+    cur.close(); conn.close()
+
+    json_response(handler, 200, {
+        "mfa_enabled": False,
+        "disabled_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "disabled_by": "admin"
+    })
+
+
 def handle_secrets_rotate(handler, body):
     import uuid as _uuid
     secret_type = body.get("secret_type", "")
@@ -1305,6 +1492,14 @@ class RelayHandler(BaseHTTPRequestHandler):
         elif self.path.startswith("/api/v1/admin/machines/") and self.path.endswith("/rotate-secret"):
             machine_id = self.path.split("/")[5]
             handle_machine_rotate_secret(self, machine_id, body)
+        elif self.path == "/api/v1/admin/admin-users":
+            handle_admin_users_create(self, body)
+        elif self.path.startswith("/api/v1/admin/admin-users/") and self.path.endswith("/mfa/setup"):
+            admin_id = self.path.split("/")[5]
+            handle_admin_mfa_setup(self, admin_id)
+        elif self.path.startswith("/api/v1/admin/admin-users/") and self.path.endswith("/mfa/verify"):
+            admin_id = self.path.split("/")[5]
+            handle_admin_mfa_verify(self, admin_id, body)
         else:
             json_response(self, 404, {"error": {"code": "NOT_FOUND", "message": f"Route {self.path} introuvable"}})
 
@@ -1321,6 +1516,12 @@ class RelayHandler(BaseHTTPRequestHandler):
         elif self.path.startswith("/api/v1/admin/groups/"):
             group_id = self.path.split("/")[5]
             handle_group_delete(self, group_id)
+        elif self.path.startswith("/api/v1/admin/admin-users/") and self.path.endswith("/mfa"):
+            admin_id = self.path.split("/")[5]
+            handle_admin_mfa_disable(self, admin_id)
+        elif self.path.startswith("/api/v1/admin/admin-users/"):
+            admin_id = self.path.split("/")[5]
+            handle_admin_users_delete(self, admin_id)
         else:
             json_response(self, 404, {"error": {"code": "NOT_FOUND", "message": f"Route {self.path} introuvable"}})
 
@@ -1337,6 +1538,9 @@ class RelayHandler(BaseHTTPRequestHandler):
         elif self.path.startswith("/api/v1/admin/gpo/"):
             gpo_id = self.path.split("/")[5]
             handle_gpo_patch(self, gpo_id, body)
+        elif self.path.startswith("/api/v1/admin/admin-users/"):
+            admin_id = self.path.split("/")[5]
+            handle_admin_users_patch(self, admin_id, body)
         else:
             json_response(self, 404, {"error": {"code": "NOT_FOUND", "message": f"Route {self.path} introuvable"}})
 
@@ -1384,6 +1588,8 @@ class RelayHandler(BaseHTTPRequestHandler):
             handle_logs_audit(self)
         elif self.path == "/api/v1/admin/settings":
             handle_settings_get(self)
+        elif self.path == "/api/v1/admin/admin-users" or self.path.startswith("/api/v1/admin/admin-users?"):
+            handle_admin_users_list(self)
         elif self.path.startswith("/api/v1/admin/dashboard/stats"):
             handle_dashboard_stats(self)
         elif self.path.startswith("/api/v1/enrollment/tokens"):
