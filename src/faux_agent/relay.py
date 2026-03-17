@@ -40,19 +40,91 @@ def make_jwt(username: str, role: str, user_id: str) -> str:
     }
     return _jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
 
-def json_response(handler, code, data):
+# ── Rate Limiting ─────────────────────────────────────────────
+# Stockage en mémoire : {key: [timestamp, ...]}
+_rate_buckets: dict = defaultdict(list)
+
+RATE_LIMITS = {
+    # Agents
+    "agent:poll":   {"limit": 1,   "window": 30},
+    "agent:logs":   {"limit": 10,  "window": 60},
+    "agent:report": {"limit": 5,   "window": 60},
+    # Admins
+    "admin:read":   {"limit": 100, "window": 60},
+    "admin:write":  {"limit": 30,  "window": 60},
+    "admin:bulk":   {"limit": 5,   "window": 60},
+    # Global
+    "global":       {"limit": 10000, "window": 60},
+}
+
+def _get_rate_key(path: str, method: str, identifier: str) -> str:
+    if path.startswith("/api/v1/agent/poll"):
+        return f"agent:poll:{identifier}"
+    if path.startswith("/api/v1/agent/logs"):
+        return f"agent:logs:{identifier}"
+    if path.startswith("/api/v1/agent/gpo/report"):
+        return f"agent:report:{identifier}"
+    if method in ("GET", "HEAD"):
+        return f"admin:read:{identifier}"
+    return f"admin:write:{identifier}"
+
+def check_rate_limit(path: str, method: str, identifier: str) -> tuple:
+    """Retourne (allowed, limit, remaining, reset)"""
+    now    = time.time()
+    key    = _get_rate_key(path, method, identifier)
+    prefix = key.rsplit(":", 1)[0]
+    config = RATE_LIMITS.get(prefix, RATE_LIMITS["admin:read"])
+    window = config["window"]
+    limit  = config["limit"]
+
+    # Nettoyer les entrées expirées
+    _rate_buckets[key] = [t for t in _rate_buckets[key] if now - t < window]
+
+    remaining = max(0, limit - len(_rate_buckets[key]))
+    reset     = int(now) + window
+
+    if len(_rate_buckets[key]) >= limit:
+        return False, limit, 0, reset
+
+    _rate_buckets[key].append(now)
+
+    # Global
+    _rate_buckets["global"] = [t for t in _rate_buckets["global"] if now - t < 60]
+    if len(_rate_buckets["global"]) >= RATE_LIMITS["global"]["limit"]:
+        return False, limit, 0, reset
+    _rate_buckets["global"].append(now)
+
+    return True, limit, remaining - 1, reset
+
+def json_response(handler, code, data, rate_info: tuple = None):
+    import uuid as _uuid
+    request_id = f"req_{_uuid.uuid4().hex[:12]}"
+
+    # Ajouter request_id et timestamp aux erreurs
+    if "error" in data:
+        data["error"]["request_id"] = request_id
+        data["error"]["timestamp"]  = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
     body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
     handler.send_response(code)
     handler.send_header("Content-Type", "application/json")
     handler.send_header("Content-Length", len(body))
     handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.send_header("X-Request-ID", request_id)
+    if rate_info:
+        _, limit, remaining, reset = rate_info
+        handler.send_header("X-RateLimit-Limit",     str(limit))
+        handler.send_header("X-RateLimit-Remaining", str(remaining))
+        handler.send_header("X-RateLimit-Reset",     str(reset))
     handler.end_headers()
     handler.wfile.write(body)
 
 def empty_response(handler, code):
+    import uuid as _uuid
     handler.send_response(code)
     handler.send_header("Content-Length", "0")
     handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.send_header("X-Request-ID", f"req_{_uuid.uuid4().hex[:12]}")
     handler.end_headers()
 
 # ── Routes ────────────────────────────────────────────────────
@@ -1439,6 +1511,17 @@ class RelayHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         print(f"=> {self.command} {self.path} {args[1]}")
 
+    def _check_rate(self):
+        identifier = self.client_address[0]
+        allowed, limit, remaining, reset = check_rate_limit(self.path, self.command, identifier)
+        if not allowed:
+            json_response(self, 429,
+                {"error": {"code": "RATE_LIMITED", "message": "Trop de requetes"}},
+                rate_info=(False, limit, 0, reset))
+            return False
+        self._rate_info = (True, limit, remaining, reset)
+        return True
+
     def do_OPTIONS(self):
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -1447,6 +1530,7 @@ class RelayHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
+        if not self._check_rate(): return
         length = int(self.headers.get("Content-Length", 0))
         body   = json.loads(self.rfile.read(length)) if length else {}
 
@@ -1504,6 +1588,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             json_response(self, 404, {"error": {"code": "NOT_FOUND", "message": f"Route {self.path} introuvable"}})
 
     def do_DELETE(self):
+        if not self._check_rate(): return
         if self.path.startswith("/api/v1/enrollment/tokens/"):
             token_id = self.path.split("/")[-1]
             handle_enrollment_token_delete(self, token_id)
@@ -1526,6 +1611,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             json_response(self, 404, {"error": {"code": "NOT_FOUND", "message": f"Route {self.path} introuvable"}})
 
     def do_PATCH(self):
+        if not self._check_rate(): return
         length = int(self.headers.get("Content-Length", 0))
         body   = json.loads(self.rfile.read(length)) if length else {}
 
@@ -1545,6 +1631,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             json_response(self, 404, {"error": {"code": "NOT_FOUND", "message": f"Route {self.path} introuvable"}})
 
     def do_PUT(self):
+        if not self._check_rate(): return
         length = int(self.headers.get("Content-Length", 0))
         body   = json.loads(self.rfile.read(length)) if length else {}
         if self.path == "/api/v1/admin/settings":
@@ -1553,6 +1640,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             json_response(self, 404, {"error": {"code": "NOT_FOUND", "message": f"Route {self.path} introuvable"}})
 
     def do_GET(self):
+        if not self._check_rate(): return
         if self.path == "/api/v1/admin/machines" or self.path.startswith("/api/v1/admin/machines?"):
             handle_machines(self)
         elif self.path.startswith("/api/v1/admin/machines/"):
