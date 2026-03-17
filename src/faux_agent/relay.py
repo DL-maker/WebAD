@@ -909,7 +909,7 @@ def handle_dashboard_stats(handler):
     cur.execute("SELECT COUNT(*) as count FROM users")
     user_count = cur.fetchone()["count"]
 
-    cur.execute("SELECT COUNT(*) as count FROM 'groups'")
+    cur.execute('SELECT COUNT(*) as count FROM "groups"')
     group_count = cur.fetchone()["count"]
 
     cur.execute("SELECT status, COUNT(*) as count FROM gpo GROUP BY status")
@@ -927,10 +927,13 @@ def handle_dashboard_stats(handler):
             "active":   machine_rows.get("active", 0),
             "inactive": machine_rows.get("inactive", 0),
             "pending":  machine_rows.get("pending", 0),
+            "revoked":  machine_rows.get("revoked", 0),
         },
         "agents": {
-            "online":  agent_rows.get("online", 0),
-            "offline": agent_rows.get("offline", 0),
+            "online":   agent_rows.get("online", 0),
+            "offline":  agent_rows.get("offline", 0),
+            "error":    agent_rows.get("error", 0),
+            "updating": agent_rows.get("updating", 0),
         },
         "users":  {"total": user_count},
         "groups": {"total": group_count},
@@ -939,6 +942,14 @@ def handle_dashboard_stats(handler):
             "active":   gpo_rows.get("active", 0),
             "draft":    gpo_rows.get("draft", 0),
             "archived": gpo_rows.get("archived", 0),
+        },
+        "compliance": {
+            "fully_compliant_machines": machine_rows.get("active", 0),
+            "partially_compliant":      0,
+            "non_compliant":            machine_rows.get("inactive", 0),
+            "compliance_rate_percent":  round(
+                machine_rows.get("active", 0) / max(sum(machine_rows.values()), 1) * 100, 1
+            )
         },
         "recent_activity": [
             {"type": r["action"], "message": f"{r['action']} on {r['resource_type']}", "timestamp": str(r["timestamp"])}
