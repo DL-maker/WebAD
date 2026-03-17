@@ -39,10 +39,10 @@ Le relay écoute sur `http://127.0.0.1:4444`.
 
 ## 4. Obtenir un token JWT
 
+> **Note** : Le token JWT est généré de manière aléatoire à chaque login via la bibliothèque **PyJWT** (algorithme HS256) avec une expiration de 3600 secondes. Le secret TOTP pour le MFA est également généré de manière aléatoire via **pyotp** (`pyotp.random_base32()`) — un secret différent est produit à chaque appel de `/mfa/setup`.
+
 ```bash
-curl -X POST http://127.0.0.1:4444/api/v1/admin/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{
+curl -X POST http://127.0.0.1:4444/api/v1/admin/auth/login -H "Content-Type: application/json" -d '{
   "username": "admin",
   "password": "Admin1234!"
 }'
